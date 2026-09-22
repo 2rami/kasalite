@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>kasaterm</title>
+<!-- 상대 경로 — `/term` 로도 유저 주소 `/u/<slug>/term` 로도 열린다(grid.html 머리말). -->
+<link rel="stylesheet" href="term/xterm.css">
+<style>
+  /* kasaterm 이 실제로 쓰는 폰트(D2Coding Nerd Font)를 서브셋해 내려준다 —
+     화면이 여기와 같아 보이려면 같은 폰트여야 하고, 폰 기본 폰트에는 Nerd Font
+     아이콘(사설영역)도 한글 고정폭도 없다.
+     ⚠️ **Mono 변종을 쓰면 안 된다.** 그쪽은 한글을 0.5em 으로 눌러 1셀에 맞추는데
+     터미널은 한글을 2셀로 잡으므로, 글리프가 칸의 절반만 채워 자간이 벌어진 것처럼
+     보인다(실측 advance: Mono 한글 500 = ASCII 와 동일). 논-Mono 는 한글 1000 으로
+     정확히 2셀이고 아이콘은 500 으로 1셀이라 둘 다 맞다 — gpu.rs 의 폴백 체인이
+     한글을 논-Mono 에 맡기는 이유와 같다. */
+  @font-face {
+    font-family: 'KasaTerm';
+    src: url('term/font.woff2') format('woff2');
+    font-display: swap;
+  }
+  html, body { margin: 0; height: 100%; background: #12161c; }
+  /* 헤더(44px) 바로 아래에서 데이터가 시작한다 — 300px 룰 안이고, 헤더가 자리를
+     가져야 터미널 첫 줄과 겹치지 않는다. safe-area-top: 노치 기기에서 첫 줄이
+     노치 뒤로 숨는 것을 막는다. */
+  #term {
+    position: absolute;
+    inset: calc(50px + env(safe-area-inset-top, 0px)) 8px
+      calc(var(--bar) + env(safe-area-inset-bottom, 0px) + var(--keyboard-inset, 0px)) 8px;
+  }
+  :root { --bar: 8px; }
+  body.has-bar { --bar: 58px; }
+
+  /* xterm 기본 스크롤바는 밝은 톤이라 어두운 터미널 위에서 흰 띠로 튄다. */
+  .xterm-viewport::-webkit-scrollbar { width: 10px; }
+  .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+  .xterm-viewport::-webkit-scrollbar-thumb { background: #2c3543; border-radius: 5px; }
+  .xterm-viewport { scrollbar-width: thin; scrollbar-color: #2c3543 transparent; }
+
+  /* 누구 화면인지가 폰에서 제일 먼저 필요한 정보다. 우상단 칩은 터미널 첫 줄과
+     겹쳐 뒤 글자가 비쳤다 — kasaterm pane 헤더처럼 **자기 자리를 가진 상단 바**로
+     둔다(좌측 프사+이름, 데스크톱과 같은 문법). 바 전체가 세션 전환 손잡이다
+     (누르면 아래 시트, 2026-08-17 「전환 ui 직접구축」). min-height 44 = 터치 타깃. */
+  #status {
+    position: absolute; left: 0; right: 0; top: 0; z-index: 5;
+    display: none; align-items: center; gap: 8px; min-height: 44px;
+    box-sizing: border-box;
+    font: 13px/1 'KasaTerm', ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #c8d0d9; background: #161b23;
+    border-bottom: 1px solid #232b36;
+    padding: 0 14px 0 12px;
+    padding-top: env(safe-area-inset-top, 0px); cursor: pointer;
+  }
+  #status.on { display: flex; }
+  #status.waiting { color: #ffd479; border-bottom-color: #5a4a24; }
+  #status:active { background: #1d242e; }
+  #who { flex: 0 0 auto; }
+  /* 작업 제목(claude) 또는 경로(셸) — 이름 옆에 흐리게, 남는 폭만 쓴다. */
+  #whot {
+    flex: 0 1 auto; min-width: 0; font-size: 11px; color: #8fa0b3;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #chev { flex: 0 0 auto; margin-left: auto; opacity: .5; font-size: 10px; }
+  #avatar {
+    width: 22px; height: 22px; border-radius: 50%;
+    object-fit: cover; flex: 0 0 auto; display: none;
+  }
+  /* 프사 없는 pane 도 헤더 왼쪽이 비지 않게 — 시트의 .hole 과 같은 문법. */
+  #ahole {
+    width: 22px; height: 22px; border-radius: 50%; flex: 0 0 auto;
+    background: #222a35; color: #6b7a8d; display: flex;
+    align-items: center; justify-content: center; font-size: 11px;
+  }
+
+  /* ── 세션 시트 — 칩을 누르면 아래에서 올라온다 ─────────────────────────
+     transform 으로만 움직인다(§④): 자리를 남긴 채 그림만 옮겨야 터미널이 안 뛴다. */
+  #dim {
+    position: fixed; inset: 0; z-index: 19; background: rgba(0, 0, 0, .45);
+    opacity: 0; pointer-events: none; transition: opacity .18s ease;
+  }
+  #sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+    background: #171c24; border-top: 1px solid #2a323e;
+    border-radius: 14px 14px 0 0;
+    max-height: 78dvh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 6px 10px calc(10px + env(safe-area-inset-bottom, 0px)) 10px;
+    transform: translateY(102%); transition: transform .2s ease-out;
+  }
+  body.sheet-open #sheet { transform: translateY(0); }
+  body.sheet-open #dim { opacity: 1; pointer-events: auto; }
+  @media (prefers-reduced-motion: reduce) {
+    #sheet, #dim { transition: none; }
+  }
+  /* 잡아 내리는 손맛 흉내가 아니라 「시트다」라는 표지 — 상단 중앙 손잡이. */
+  #sheet::before {
+    content: ''; display: block; width: 36px; height: 4px; margin: 4px auto 8px;
+    border-radius: 2px; background: #2f3846;
+  }
+  /* ── 방(윈도우) 구획 — 데스크톱 좌측 사이드바의 「목록」 모드를 따른다:
+     방 이름 헤더 + pane 줄 + 활성 방은 채움이 아니라 accent 아웃라인. */
+  .sect { margin: 6px 0 4px; padding: 2px 4px 4px; border-radius: 10px; }
+  /* 활성 방 아웃라인 — 원색 1.5px 는 시트 전폭에서 너무 앞으로 나온다. */
+  .sect.active { box-shadow: inset 0 0 0 1px rgba(122, 162, 247, .5); }
+  .shead {
+    display: flex; align-items: baseline; gap: 8px; padding: 6px 8px 4px;
+    font: 700 13px/1.2 'KasaTerm', ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #dde3ea;
+  }
+  .shead .cwd {
+    font-weight: 400; font-size: 11px; color: #8fa0b3; flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .shead .cnt { font-weight: 400; font-size: 11px; color: #6b7a8d; flex: 0 0 auto; }
+  .srow {
+    position: relative;
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    min-height: 52px; padding: 6px 10px; border: 0; border-radius: 10px;
+    background: none; text-align: left; cursor: pointer;
+    font: 14px/1.3 'KasaTerm', ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #dde3ea;
+  }
+  /* 줄 사이 1px 실선 — 사이드바 목록과 같은 결(theme::border 50%). */
+  .sect .srow + .srow { border-top: 1px solid rgba(42, 50, 62, .5); border-radius: 0; }
+  .srow:active { background: #222a35; }
+  .srow.cur { background: rgba(122, 162, 247, .12); }
+  /* 보는 중 = 왼쪽 2px accent 띠(사이드바 활성 pane 표기). */
+  .srow.cur::before {
+    content: ''; position: absolute; left: 0; top: 8px; bottom: 8px;
+    width: 2px; border-radius: 1px; background: #7aa2f7;
+  }
+  /* 줄 끝 상태 점 — 대기(내 손 필요)만 0.9s 로 숨쉰다(데스크톱 blink_dot 규칙).
+     busy 는 점을 밝힐 뿐 파랗게 칠하지 않는다(온통 파래짐 방지 — 같은 규칙). */
+  .dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%;
+    background: rgba(154, 166, 180, .35); }
+  .dot.busy { background: #9aa6b4; }
+  .dot.wait { background: #ffd479; animation: dotblink .9s steps(1) infinite; }
+  @keyframes dotblink { 50% { opacity: .15; } }
+  @media (prefers-reduced-motion: reduce) { .dot.wait { animation: none; } }
+  .srow img { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; flex: 0 0 auto; }
+  /* 프사 없는 pane(셸 pane)도 줄이 안 흔들리게 같은 크기의 원을 채운다 —
+     글리프는 KasaTerm 의 프롬프트 화살표라 「터미널」이라고 스스로 말한다. */
+  .srow .hole {
+    width: 26px; height: 26px; border-radius: 50%; flex: 0 0 auto;
+    background: #222a35; color: #6b7a8d; display: flex;
+    align-items: center; justify-content: center; font-size: 12px;
+    font-family: 'KasaTerm', ui-monospace, monospace;
+  }
+  .srow .txt { flex: 1 1 auto; min-width: 0; }
+  .srow .t1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .srow .t2 {
+    margin-top: 2px; font-size: 12px; color: #8fa0b3;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .srow .tag { flex: 0 0 auto; font-size: 11px; color: #7aa2f7; }
+  .srow .tag.wait { color: #ffd479; }
+
+  /* 하단 바 — 소프트 키보드가 올라오면 visualViewport 로 그 위에 얹는다.
+     transform 으로만 움직인다(§④): position 을 바꾸면 터미널이 뛴다. */
+  #bar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    display: none; gap: 8px; align-items: center;
+    padding: 6px 10px calc(6px + env(safe-area-inset-bottom, 0px)) 10px;
+    background: #161b23; border-top: 1px solid #232b36;
+    will-change: transform;
+  }
+  body.has-bar #bar { display: flex; }
+  #bar button {
+    min-height: 44px;                    /* iOS HIG 터치 타깃 */
+    font: 16px/1 'KasaTerm', ui-monospace, SFMono-Regular, Menlo, monospace;  /* 16px 미만이면 iOS 가 확대한다 */
+    color: #aeb9c6; background: #1d242e;
+    border: 1px solid #29313d; border-radius: 10px;
+    flex: 1 1 0; min-width: 44px; padding: 0 6px;
+  }
+  #bar button:active { background: #2c3543; color: #dde3ea; }
+  /* 격자 전환은 성격이 다른 버튼 — 키가 아니라 모드다. accent 로 가른다. */
+  #fitbtn { flex: 0 0 52px; color: #7aa2f7; border-color: rgba(122, 162, 247, .35); }
+</style>
+<link rel="stylesheet" href="term/chrome.css">
+</head>
+<body>
+<div id="term"></div>
+<div class="term-mode-note">기본 문자 보기 <a id="native-view">앱 보기</a></div>
+<div id="status" class="term-heading" role="button" tabindex="0" aria-haspopup="dialog" aria-expanded="false" aria-label="세션 전환">
+  <span class="term-avatar"><img id="avatar" alt=""><span id="ahole"></span></span>
+  <span class="term-labels"><span id="who"></span><span id="whot"></span></span>
+  <span class="term-context"><span id="machine-badge"><span id="machine-name"></span></span><span id="model-label"></span><span id="pane-state"></span></span>
+  <svg id="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+</div>
+<div id="dim"></div>
+<div id="sheet" role="dialog" aria-label="세션 목록"><div id="rows"></div></div>
+<div id="bar">
+  <button id="fitbtn" aria-label="폰 크기 / 원래 크기 전환" aria-pressed="false">⤢</button>
+  <button data-seq="\x1b" aria-label="Esc">esc</button>
+  <button data-seq="\t" aria-label="Tab">⇥</button>
+  <button data-seq="\x03" aria-label="Ctrl-C">^C</button>
+  <button data-seq="\x1b[A" aria-label="위">↑</button>
+  <button data-seq="\x1b[B" aria-label="아래">↓</button>
+</div>
+<script src="term/xterm.js"></script>
+<script src="term/viewport.js"></script>
+<script src="term/chrome.js"></script>
+<script>
+(async () => {
+  // 주소 접두(`/u/<slug>` · `/u/<slug>/m/<기계>` · 없음)를 그대로 물려받는다 — fetch 도 WS 도
+  // 같은 문으로 나가야 자격이 따라간다.
+  const ROOT = location.pathname.replace(/\/term\/?$/, '');
+  const ansiRequested = location.search.slice(1).split('&').some(part => {
+    const [key, value] = part.split('=');
+    return key === 'renderer' && value === 'ansi';
+  });
+  // pane id 는 `%151` 처럼 생겼는데, URLSearchParams 는 그 `%15` 를 퍼센트 인코딩으로
+  // 읽어 0x15 로 디코딩한다 — 남는 건 제어문자+`1` 이라 목록 매칭도 칩도 조용히 깨진다.
+  // (오류가 안 나서 「이름이 원래 안 뜨나 보다」로 보인다.) raw 쿼리에서 직접 꺼낸다.
+  let paneId = (() => {
+    const hit = location.search.slice(1).split('&').find((s) => s.startsWith('pane='));
+    return hit ? hit.slice(5) : '';
+  })();
+  // 주소에 pane 이 없으면 kasaterm 의 pane 으로 **자동 연결**한다(활성 방 우선) —
+  // 폰의 쓸모는 웹 전용 셸이 아니라 데스크톱 화면을 그대로 보는 것이다(2026-08-20
+  // 지시). 목록을 못 얻거나 pane 이 하나도 없을 때만 서버의 셸 스폰에 떨어진다.
+  if (!paneId) {
+    try {
+      const [list, sess] = await Promise.all([
+        fetch(`${ROOT}/term/panes`).then((r) => r.json()),
+        fetch(`${ROOT}/sessions`).then((r) => r.json()).catch(() => null),
+      ]);
+      const real = list.filter((p) => !p.id.startsWith('web-'));
+      const inActive = sess ? real.filter((p) => p.window === sess.active) : [];
+      const pick = inActive[0] || real[0];
+      if (pick) {
+        paneId = pick.id;
+        // 주소도 따라간다 — 새로고침이 같은 pane 을 가리키게. 토큰은 이미 쿠키다.
+        const parts = location.search.slice(1).split('&').filter(part => part && !part.startsWith('pane='));
+        parts.push(`pane=${encodeURIComponent(paneId)}`);
+        history.replaceState(null, '', `${location.pathname}?${parts.join('&')}${location.hash}`);
+      }
+    } catch {}
+  }
+  // The default enters the composed grid before opening any socket or accepting input.
+  if (!ansiRequested) {
+    location.replace(`${ROOT}/term/grid${location.search}${location.hash}`);
+    return;
+  }
+  document.body.classList.add('ansi-view');
+  // 이 연결이 실제로 붙은 세션 id. 서버가 size 메시지로 확정해 준다 —
+  // 목록에서 「보는 중」을 제 행에 붙이는 근거다.
+  let selfId = paneId;
+  let connectedPane = null;
+  const nativeView = document.getElementById('native-view');
+  function sessionQuery(id, keepRenderer = true) {
+    const parts = location.search.slice(1).split('&').filter(part => part && !part.startsWith('pane=')
+      && (keepRenderer || !part.startsWith('renderer=')));
+    parts.push(`pane=${encodeURIComponent(id)}`);
+    return `?${parts.join('&')}`;
+  }
+  nativeView.addEventListener('click', event => event.stopPropagation());
+  // 웹 셸의 uuid 는 사람이 읽을 이름이 아니다 — 「웹 셸 · e0de」로 접는다.
+  const prettyId = (id) =>
+    id.startsWith('web-') ? `웹 셸 · ${id.slice(4, 8)}` : id;
+  const statusEl = document.getElementById('status');
+  const whoEl = document.getElementById('who');
+  const avatarEl = document.getElementById('avatar');
+  // 헤더는 항상 떠 있다 — 세션 전환 손잡이를 겸하므로, 연결이 죽어도 다른
+  // pane 으로 갈 길이 남아야 한다.
+  // 프사가 404(목록 밖 커스텀 캐릭터)면 깨진 그림 대신 기본 구멍으로.
+  avatarEl.onerror = () => {
+    avatarEl.style.display = 'none';
+    document.getElementById('ahole').style.display = 'flex';
+  };
+  const setWho = (text, slug, title, color) => {
+    whoEl.textContent = text || '셸';
+    // 학생색 — 목록과 같은 헤더 테마. 이름 없는 호출(연결 오류 등)은 원색으로.
+    whoEl.style.color = color || '';
+    document.getElementById('whot').textContent = title || '';
+    statusEl.classList.add('on');
+    const hole = document.getElementById('ahole');
+    if (slug) {
+      avatarEl.src = `${ROOT}/term/avatar/${encodeURIComponent(slug)}.png`;
+      avatarEl.style.display = 'block';
+      hole.style.display = 'none';
+    } else {
+      avatarEl.style.display = 'none';
+      hole.style.display = 'flex';
+    }
+  };
+  const bar = document.getElementById('bar');
+  const fitBtn = document.getElementById('fitbtn');
+
+  // 물리 키보드가 있으면 esc/tab 버튼은 자리만 먹는다. pane 선택은 양쪽 다 쓰므로
+  // 바 자체는 터치 기기에서만 띄우고, 데스크톱은 예전처럼 터미널만 남긴다.
+  const touch = matchMedia('(hover: none)').matches;
+  if (touch) document.body.classList.add('has-bar');
+
+  const term = new Terminal({
+    // 웹폰트가 못 오면 맥에 설치된 같은 폰트가 받는다. Menlo 는 한글이 없어 맨 뒤.
+    fontFamily: '"KasaTerm", "D2Coding", ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontSize: 13,
+    cursorBlink: true,
+    allowProposedApi: true,
+    theme: {
+      background: '#12161c', foreground: '#c8d0d9', cursor: '#7aa2f7',
+      selectionBackground: '#2c3543',
+    },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+  fit.fit();
+  const chrome = KasaTermChrome.create({ root: ROOT, pane: selfId,
+    onTheme: tokens => { term.options.theme = { ...term.options.theme, ...KasaTermChrome.xtermTheme(tokens) }; },
+  });
+
+  const terminalRoot = document.getElementById('term');
+  const BASE_FONT = 13;
+  let baseCell = null;
+  let mirror = false, confirmed = null, orig = null, fitted = false, legacyTarget = null;
+  function rememberBaseCell() {
+    const cell = term._core?._renderService?.dimensions?.css?.cell;
+    if (term.options.fontSize === BASE_FONT && cell?.width > 0 && cell?.height > 0) {
+      baseCell = { width: cell.width, height: cell.height };
+    }
+    return baseCell;
+  }
+  function targetSize() {
+    const cell = baseCell || rememberBaseCell();
+    if (!cell) return null;
+    const area = KasaViewport.visibleArea(terminalRoot);
+    const scrollbar = term._core?.viewport?.scrollBarWidth || 0;
+    return {
+      cols: Math.floor(Math.max(0, area.width - scrollbar) / cell.width),
+      rows: Math.floor(area.height / cell.height),
+    };
+  }
+  function containConfirmed() {
+    if (!confirmed || !baseCell) return;
+    const area = KasaViewport.visibleArea(terminalRoot);
+    if (!area.width || !area.height) return;
+    const scrollbar = term._core?.viewport?.scrollBarWidth || 0;
+    const scale = Math.min(1,
+      Math.max(0, area.width - scrollbar) / (confirmed.cols * baseCell.width),
+      area.height / (confirmed.rows * baseCell.height));
+    // Change the font itself: CSS scaling would leave xterm mouse coordinates unscaled.
+    const size = Math.max(0.1, Math.floor(BASE_FONT * scale * 100) / 100);
+    if (size !== term.options.fontSize) term.options.fontSize = size;
+  }
+  rememberBaseCell();
+  const viewport = KasaViewport.create({
+    measure: targetSize,
+    onState: (state) => {
+      if (!state.ready) return;
+      const active = state.capable ? state.granted && state.wanted : fitted;
+      fitBtn.setAttribute('aria-pressed', String(active));
+      fitBtn.style.background = active ? 'rgba(122, 162, 247, .28)' : '';
+      fitBtn.setAttribute('aria-label', active ? '이 화면 크기 맞춤 해제' : '이 화면 크기로 맞추기');
+    },
+  });
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const socketURL = () => `${proto}://${location.host}${ROOT}/term/ws${connectedPane ? sessionQuery(connectedPane) : location.search}`;
+  let ws = null;
+  let gone = false, backoff = 1000, retryTimer = null, reconnects = 0;
+  const handlers = {};
+  const connect = () => {
+    if (gone || document.visibilityState !== 'visible') return;
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+    clearTimeout(retryTimer);
+    const socket = new WebSocket(socketURL());
+    ws = socket;
+    mirror = false; confirmed = null; orig = null; fitted = false; legacyTarget = null;
+    viewport.bind(socket);
+    socket.binaryType = 'arraybuffer';
+    for (const [event, handler] of Object.entries(handlers)) {
+      socket[`on${event}`] = (e) => { if (ws === socket) handler(e, socket); };
+    }
+  };
+  const schedule = () => {
+    clearTimeout(retryTimer);
+    if (document.visibilityState !== 'visible') return;
+    retryTimer = setTimeout(connect, backoff);
+    backoff = Math.min(backoff * 2, 10000);
+  };
+  document.addEventListener('visibilitychange', () => {
+    viewport.visibilityChanged();
+    if (document.visibilityState === 'visible') {
+      backoff = 1000; connect(); syncSize();
+    } else if (mirror && fitted && !viewport.state().capable) {
+      // Old servers only restore an explicit force-fit safely when its socket leaves.
+      ws?.close();
+    }
+  });
+  window.addEventListener('online', () => { backoff = 1000; connect(); });
+  window.addEventListener('pageshow', () => { connect(); viewport.visibilityChanged(); });
+  window.addEventListener('pagehide', () => {
+    viewport.release();
+    const socket = ws;
+    viewport.disconnected(socket);
+    ws = null;
+    socket?.close();
+    clearTimeout(retryTimer);
+  });
+  handlers.message = (e, socket) => {
+    if (typeof e.data === 'string') {
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      if (m.t === 'gone') {
+        gone = true;
+        viewport.release();
+        term.write('\r\n\x1b[33m● 이 세션은 끝났어요 — 위 이름을 눌러 다른 pane 을 고르세요\x1b[0m\r\n');
+      } else if (m.t === 'size') {
+        mirror = !!m.mirror;
+        if (m.id) {
+          selfId = m.id; connectedPane = m.id;
+          history.replaceState(null, '', `${location.pathname}${sessionQuery(m.id)}${location.hash}`);
+          nativeView.href = `${ROOT}/term/grid${sessionQuery(m.id, false)}${location.hash}`;
+          refreshChip(); chrome.setPane(m.id);
+        }
+        if (!orig) orig = { cols: m.cols, rows: m.rows };
+        if (fitted && legacyTarget && (m.cols !== legacyTarget.cols || m.rows !== legacyTarget.rows)) fitted = false;
+        confirmed = { cols: m.cols, rows: m.rows };
+        rememberBaseCell();
+        term.resize(m.cols, m.rows);
+        viewport.receive(m, socket);
+        containConfirmed();
+        if (mirror && !named) setWho('');
+        fitBtn.style.display = mirror ? '' : 'none';
+        if (!mirror) setWho('');
+      } else if (m.t === 'viewport') {
+        viewport.receive(m, socket);
+        containConfirmed();
+      }
+      return;
+    }
+    term.write(new Uint8Array(e.data));
+  };
+  const enc = new TextEncoder();
+  const send = (s) => { if (ws && ws.readyState === 1) ws.send(enc.encode(s)); };
+  term.onData(send);
+  fitBtn.addEventListener('pointerdown', (ev) => {
+    ev.preventDefault();
+    if (!ws || ws.readyState !== 1 || !viewport.state().ready || !mirror) return;
+    if (viewport.state().capable) {
+      if (viewport.state().granted && viewport.state().wanted) viewport.setWanted(false);
+      else viewport.acquire();
+    } else {
+      fitted = !fitted;
+      const target = fitted ? targetSize() : orig;
+      if (!target) return;
+      legacyTarget = { cols: Math.max(20, target.cols), rows: Math.max(5, target.rows) };
+      ws.send(JSON.stringify({ t: 'resize', ...legacyTarget, force: true }));
+      fitBtn.setAttribute('aria-pressed', String(fitted));
+      fitBtn.style.background = fitted ? 'rgba(122, 162, 247, .28)' : '';
+    }
+  });
+
+  // 스와이프 스크롤은 xterm 내장 터치에 맡긴다(viewport.handleTouchStart/Move).
+  // 여기서 터치를 가로채 합성 WheelEvent 로 바꾸는 시도는 두 번 죽는다 —
+  // capture+stopPropagation 이 내장 터치를 먼저 끊고, untrusted 휠은 기본 동작
+  // (뷰포트 네이티브 스크롤)을 못 일으켜 아무것도 안 움직인다(2026-08-20 실측).
+  // 마우스 리포팅을 켠 TUI 에서 터치가 무시되는 것은 내장 경로의 의도된 동작이다.
+
+  for (const b of bar.querySelectorAll('button[data-seq]')) {
+    // 눌러도 터미널이 포커스를 잃지 않아야 소프트 키보드가 안 내려간다.
+    b.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault();
+      send(JSON.parse(`"${b.dataset.seq}"`));
+    });
+  }
+
+  // ── 세션 시트 — 칩을 누르면 목록이 올라온다 ─────────────────────────────
+  const sheet = document.getElementById('sheet');
+  const rowsEl = document.getElementById('rows');
+  const dim = document.getElementById('dim');
+  // pane id 의 `%` 가 encodeURIComponent 로 `%25` 가 되어야 서버의 raw 폴백이
+  // 원문을 되찾는다. 토큰은 쿠키에 있으므로 주소에 다시 실을 필요가 없다.
+  const goTo = (id) => {
+    location.search = `?pane=${encodeURIComponent(id)}`;
+  };
+  const closeSheet = () => {
+    document.body.classList.remove('sheet-open');
+    statusEl.setAttribute('aria-expanded', 'false');
+    term.focus();
+  };
+  const row = (cls, avatar, t1, t2, tag, onTap) => {
+    const b = document.createElement('button');
+    b.className = `srow ${cls}`;
+    b.append(avatar);
+    const txt = document.createElement('span');
+    txt.className = 'txt';
+    const l1 = document.createElement('div');
+    l1.className = 't1';
+    l1.textContent = t1;
+    txt.append(l1);
+    if (t2) {
+      const l2 = document.createElement('div');
+      l2.className = 't2';
+      l2.textContent = t2;
+      txt.append(l2);
+    }
+    b.append(txt);
+    if (tag) b.append(tag);
+    b.addEventListener('click', onTap);
+    return b;
+  };
+  const face = (slug, fallback) => {
+    if (slug) {
+      const img = document.createElement('img');
+      img.alt = '';
+      img.src = `${ROOT}/term/avatar/${encodeURIComponent(slug)}.png`;
+      // 404(목록 밖 커스텀)면 깨진 그림 대신 기본 구멍으로.
+      img.onerror = () => {
+        const d = document.createElement('span');
+        d.className = 'hole';
+        d.textContent = fallback;
+        img.replaceWith(d);
+      };
+      return img;
+    }
+    const d = document.createElement('span');
+    d.className = 'hole';
+    d.textContent = fallback;
+    return d;
+  };
+  const badge = (text, wait) => {
+    const s = document.createElement('span');
+    s.className = wait ? 'tag wait' : 'tag';
+    s.textContent = text;
+    return s;
+  };
+  // 데스크톱 좌측 사이드바의 「목록」 모드를 폰에 옮긴 것(사용자: 목록으로 똑같이,
+  // 이름도) — 방(윈도우)별 구획 + 방 이름 헤더 + pane 줄 + 학생색 이름 + 상태 점.
+  // 정렬은 방/트리 순서 그대로다(사이드바와 같은 순서를 눈이 기억한다). 답을
+  // 기다리는 pane 은 노랑 점이 숨쉬어 훑으면 바로 보인다.
+  // 웹 전용 셸은 목록에서 뺀다 — 이 화면의 쓸모는 kasaterm 연동이다(2026-08-20).
+  const fillSheet = (list, sess) => {
+    rowsEl.replaceChildren();
+    const labels = (sess && sess.labels) || [];
+    const activeWin = sess ? sess.active : -1;
+    const groups = new Map();
+    for (const p of list) {
+      if (p.id.startsWith('web-')) continue;
+      const k = p.window ?? 'etc';
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(p);
+    }
+    const keys = [...groups.keys()]
+      .filter((k) => typeof k === 'number')
+      .sort((a, b) => a - b);
+    if (groups.has('etc')) keys.push('etc');
+    for (const k of keys) {
+      const sect = document.createElement('div');
+      sect.className = 'sect' + (k === activeWin ? ' active' : '');
+      const head = document.createElement('div');
+      head.className = 'shead';
+      let nm = '';
+      let cwd = '';
+      if (k === 'etc') nm = '기타';
+      else {
+        // /sessions 라벨은 "이름 · cwd" 꼴 — 사이드바 방 헤더처럼 가른다.
+        const cut = (labels[k] || `방 ${k + 1}`).split(' · ');
+        nm = cut[0] || `방 ${k + 1}`;
+        cwd = cut.slice(1).join(' · ');
+      }
+      const n1 = document.createElement('span');
+      n1.textContent = nm;
+      head.append(n1);
+      if (cwd) {
+        const c = document.createElement('span');
+        c.className = 'cwd';
+        c.textContent = cwd;
+        head.append(c);
+      }
+      const cnt = document.createElement('span');
+      cnt.className = 'cnt';
+      cnt.textContent = String(groups.get(k).length);
+      head.append(cnt);
+      sect.append(head);
+      for (const p of groups.get(k)) {
+        const cur = p.id === selfId;
+        const tag = cur
+          ? badge('보는 중', false)
+          : p.status === 'waiting' ? badge('● 대기', true) : null;
+        const r = row(
+          cur ? 'cur' : '',
+          face(p.slug, '❯'),
+          p.name || '셸',
+          p.title || '',
+          tag,
+          () => { if (cur) closeSheet(); else goTo(p.id); },
+        );
+        // 학생색(characters.json header_color) — 이름을 그 학생 색으로.
+        if (p.color) r.querySelector('.t1').style.color = p.color;
+        // 태그가 없는 줄은 끝에 상태 점 — idle 흐림 / busy 밝음.
+        if (!tag) {
+          const d = document.createElement('span');
+          const busy = p.status && p.status !== 'idle' && p.status !== 'waiting';
+          d.className = 'dot' + (busy ? ' busy' : '');
+          r.append(d);
+        }
+        sect.append(r);
+      }
+      rowsEl.append(sect);
+    }
+  };
+  const openSheet = () => {
+    document.body.classList.add('sheet-open');
+    statusEl.setAttribute('aria-expanded', 'true');
+    // 열 때마다 새로 묻는다 — pane 은 수시로 생기고 닫힌다. 옛 목록이라도 먼저
+    // 보여야 손맛이 살므로, 이전 내용은 응답이 와서 갈릴 때까지 남겨 둔다.
+    // 방 이름(/sessions)은 못 얻어도 목록은 뜬다(서수 폴백).
+    Promise.all([
+      fetch(`${ROOT}/term/panes`).then((r) => r.json()),
+      fetch(`${ROOT}/sessions`).then((r) => r.json()).catch(() => null),
+    ]).then(([list, sess]) => {
+      paneList = list;
+      fillSheet(list, sess);
+      refreshChip();
+    }).catch(() => {});
+  };
+  statusEl.addEventListener('click', () => {
+    if (document.body.classList.contains('sheet-open')) closeSheet();
+    else openSheet();
+  });
+  dim.addEventListener('click', closeSheet);
+
+  // 첫 로드: 우상단 칩을 id 대신 이름과 프사로 — kasaterm pane 헤더가 보여 주는
+  // 것과 같다. 이름을 모르는 pane(웹 셸)은 접은 id 만 남는다.
+  //
+  // 대조 열쇠는 주소의 paneId 가 아니라 **서버가 준 selfId** 다. 주소는 우리가
+  // 만들 때 `%0` 을 `%250` 으로 인코딩하고 클라는 그걸 원문 그대로 읽으므로
+  // (URLSearchParams 디코딩이 `%15x` id 를 깨는 문제의 반대면), 목록의 id 와
+  // 문자열이 안 맞는다. 목록 응답과 size 메시지의 순서를 못 정하니 양쪽 다에서
+  // 부른다 — 늦게 온 쪽이 완성한다.
+  let named = false;
+  let paneList = null;
+  const refreshChip = () => {
+    const me = (paneList || []).find((p) => p.id === selfId);
+    if (me) {
+      named = true;
+      setWho(
+        me.name || (me.id.startsWith('web-') ? prettyId(me.id) : ''),
+        me.slug,
+        me.title || '',
+        me.color,
+      );
+      chrome.updatePane(me);
+      statusEl.classList.toggle('waiting', me.status === 'waiting');
+    }
+  };
+  fetch(`${ROOT}/term/panes`).then((r) => r.json()).then((list) => {
+    paneList = list;
+    refreshChip();
+  }).catch(() => {});
+
+  const syncSize = () => {
+    rememberBaseCell();
+    viewport.schedule();
+    containConfirmed();
+  };
+  handlers.open = () => {
+    // 재접속이면 곧 올 스냅샷 앞에 화면을 비운다 — 옛 화면 위에 겹쳐 그리면 줄이 섞인다.
+    if (reconnects > 0) term.reset();
+    reconnects++;
+    backoff = 1000;
+    term.options.fontSize = BASE_FONT;
+    term._core?._charSizeService?.measure();
+    rememberBaseCell();
+    term.focus();
+    setTimeout(syncSize, 0);
+  };
+  window.addEventListener('resize', syncSize);
+
+  // 웹폰트는 늦게 온다. 그 사이 xterm 은 폴백 폰트로 글자 폭을 재서 격자를 잡아
+  // 두므로, 폰트가 바뀐 뒤 다시 재지 않으면 글자가 칸에서 어긋난 채 남는다.
+  if (document.fonts?.load) {
+    document.fonts.load(`${term.options.fontSize}px KasaTerm`)
+      .then(() => {
+        term.options.fontSize = BASE_FONT;
+        term._core?._charSizeService?.measure();
+        term.clearTextureAtlas?.();
+        requestAnimationFrame(() => { rememberBaseCell(); syncSize(); });
+      })
+      .catch(() => {});
+  }
+
+  // 소프트 키보드가 올라오면 fixed 바가 그 아래로 숨는다. visualViewport 가
+  // 실제로 보이는 영역을 알려 주므로 그만큼 바를 위로 얹는다.
+  const vv = window.visualViewport;
+  if (vv) {
+    const lift = () => {
+      const hidden = Math.max(0, innerHeight - vv.height - vv.offsetTop);
+      document.documentElement.style.setProperty('--keyboard-inset', `${hidden}px`);
+      bar.style.transform = `translateY(${-hidden}px)`;
+      syncSize();
+    };
+    vv.addEventListener('resize', lift);
+    vv.addEventListener('scroll', lift);
+    lift();
+  }
+
+  // 헤더는 지우지 않는다 — 연결이 죽어도 헤더가 곧 다른 pane 으로 가는 길이다.
+  handlers.close = (_event, socket) => {
+    viewport.disconnected(socket);
+    ws = null;
+    if (gone) return;
+    term.write('\r\n\x1b[31m● 연결이 끊겼어요 — 다시 붙는 중…\x1b[0m\r\n');
+    schedule();
+  };
+  handlers.error = () => {};
+  connect();
+})();
+</script>
+</body>
+</html>

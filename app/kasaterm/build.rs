@@ -1,0 +1,247 @@
+//! Stamps the build's git revision into KASATERM_GIT_REV at compile
+//! time so the running binary can show which build it is (the launch
+//! corner banner in main.rs). Falls back to "unknown" outside a git
+//! checkout so a tarball build still compiles.
+use std::process::Command;
+
+fn main() {
+    assert_assets_are_real();
+    gen_character_slugs();
+    let rev = git_rev().unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=KASATERM_GIT_REV={rev}");
+    // 릴리스 태그에서 몇 커밋 앞인지, 그 커밋이 언제인지. 판 번호(0.1.19)만으로는
+    // 릴리스와 손수 구운 판이 구별되지 않는다 — 태그를 올리기 전까지 수백 번 구워도
+    // 셋 다 같은 번호를 말하고, 그 상태로 「최신」이라 답하면 그건 거짓말이 된다
+    // (2026-08-29 지적: "릴리스말고 나만 빌드해서 쓰는버전도있지않나" — 그때 실측이
+    // 750 커밋 앞이었다).
+    println!("cargo:rustc-env=KASATERM_GIT_AHEAD={}", git_ahead().unwrap_or_default());
+    println!("cargo:rustc-env=KASATERM_GIT_DATE={}", git_date().unwrap_or_default());
+    // Re-stamp when HEAD or the staged index moves so a fresh commit
+    // shows the new hash without a clean rebuild. Unstaged edits can't
+    // be tracked this way, so the dirty '+' may lag until the next
+    // build — acceptable for a launch banner.
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/index");
+
+    // Windows: stamp the app icon into the exe so the taskbar / Start menu /
+    // installer use it instead of the generic default. rc.exe (MSVC) does the
+    // embed; a missing toolchain just warns rather than failing the build.
+    #[cfg(windows)]
+    {
+        println!("cargo:rerun-if-changed=../../assets/app.ico");
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("../../assets/app.ico");
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=winresource icon embed failed: {e}");
+        }
+    }
+}
+
+/// 그림 에셋이 **실물인지** 본다 — git-lfs 포인터면 빌드를 세운다.
+///
+/// 이 레포는 그림을 git-lfs 로 담는다(`.gitattributes`, 3300여 개). `git lfs
+/// pull` 이 안 된 트리에서 구우면 `include_bytes!` 는 실물 대신 130바이트짜리
+/// 포인터 텍스트를 담고, **컴파일은 멀쩡히 통과한다**. 그 판은 실행 중 디코딩에서
+/// 조용히 실패해 학생 얼굴·로고가 하나도 안 뜨는데, 화면에는 오류 한 줄 없이
+/// 그냥 빈자리로 보인다 — 사람이 「에셋이 없나」로만 알 수 있다(2026-09-07
+/// 실측: 그렇게 구워진 설치본 exe 안 PNG 가 14장, 정상 빌드는 1596장이었다).
+///
+/// 표본 몇 개만 본다. LFS 가 안 받아진 트리는 그림이 **전부** 포인터라 한 장만
+/// 봐도 갈리고, 3300개를 매 빌드 열면 그 값을 못 한다.
+fn assert_assets_are_real() {
+    const SAMPLES: &[&str] = &[
+        "assets/students/idle/arisu-0.png",
+        "assets/students/profile/arisu.png",
+        "assets/students/schale-logo.png",
+        "assets/schale-classroom.png",
+        "../../assets/AppIcon.png",
+    ];
+    for rel in SAMPLES {
+        println!("cargo:rerun-if-changed={rel}");
+        let mut head = [0u8; 8];
+        let read = std::fs::File::open(rel)
+            .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+            .unwrap_or_else(|e| panic!("에셋 {rel} 를 못 읽었다: {e}"));
+        if read < 8 || head[..4] != [0x89, b'P', b'N', b'G'] {
+            panic!(
+                "에셋 {rel} 가 실물 PNG 가 아니다 — git-lfs 포인터로 보인다.\n\
+                 `git lfs pull` 로 그림을 받은 뒤 다시 구워라. 이대로 구우면 학생\n\
+                 얼굴도 로고도 하나 없는 판이 나오고, 그건 실행 중에 오류 없이\n\
+                 빈자리로만 보인다."
+            );
+        }
+    }
+}
+
+/// `characters.json` → `CHARACTER_SLUGS` 표를 생성한다.
+///
+/// **왜 코드젠인가.** 로스터의 정본은 `characters.json` 인데, 예전엔 이름↔슬러그 표를
+/// `theme.rs` 에 손으로 **한 번 더** 적었다. 두 벌이 되면 어긋나고, 어긋나도 컴파일도
+/// 실행도 통과한다 — 슬러그는 teammate inbox 파일명이라, 한쪽에만 있는 학생에게 보낸
+/// 브리프는 아무도 안 읽는 우편함에 들어가고 보낸 쪽은 성공으로 읽는다. 여기서 만들면
+/// 그 두 벌이 존재할 수가 없고, 새 테마는 JSON 하나만 갈아 끼우면 된다.
+///
+/// 잘못된 로스터는 **빌드가 거부한다**(슬러그 중복·형식 위반·필수 필드 누락). 테마를
+/// 만들다 실수하면 화면에서 이상해지기 전에 여기서 걸린다.
+fn gen_character_slugs() {
+    let json_path = "collab-hooks/characters.json";
+    println!("cargo:rerun-if-changed={json_path}");
+    let raw = std::fs::read_to_string(json_path)
+        .unwrap_or_else(|e| panic!("{json_path} 를 못 읽었다: {e}"));
+
+    // serde 를 build-dependency 로 끌어오지 않으려고 필요한 필드만 훑는다.
+    // 형식이 어긋나면(따옴표 안 닫힘 등) 아래 검사에서 개수로 걸린다.
+    // header_color 는 slug 다음 줄들에 오므로 마지막 행에 붙인다.
+    let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut name: Option<String> = None;
+    for line in raw.lines() {
+        let t = line.trim();
+        if let Some(v) = field(t, "\"name\":") {
+            name = Some(v);
+        } else if let Some(slug) = field(t, "\"slug\":") {
+            let Some(n) = name.take() else {
+                panic!("{json_path}: slug \"{slug}\" 앞에 name 이 없다 — 두 필드는 붙어 있어야 한다");
+            };
+            rows.push((n, slug, None));
+        } else if let Some(color) = field(t, "\"header_color\":") {
+            let Some(last) = rows.last_mut() else {
+                panic!("{json_path}: header_color \"{color}\" 앞에 name/slug 가 없다");
+            };
+            if last.2.is_none() {
+                last.2 = Some(color);
+            }
+        }
+    }
+
+    // `leader` 는 `leaders[0]` 과 같은 인물을 한 번 더 적어 둔 것이다 — 완전히 같은
+    // 쌍은 같은 사람이니 접는다. 이름이나 슬러그 한쪽만 겹치는 것은 아래에서 막는다.
+    rows.dedup_by(|a, b| a == b);
+    let mut seen = Vec::new();
+    rows.retain(|r| {
+        if seen.contains(r) {
+            return false;
+        }
+        seen.push(r.clone());
+        true
+    });
+
+    assert!(!rows.is_empty(), "{json_path}: 캐릭터가 하나도 없다");
+    for (n, s, c) in &rows {
+        assert!(
+            !s.is_empty()
+                && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            "{json_path}: \"{n}\" 의 슬러그 \"{s}\" 가 [a-z0-9_] 밖이다 — inbox 파일명이라 \
+             한글·대문자·하이픈이 들어가면 조용히 깨진다"
+        );
+        // 색은 pane 테두리·입력박스·sm테마가 전부 이 표에서 읽는다. 빠지면 그 학생만
+        // 테두리 없는 「색 없는 학생」이 되는데 그건 오류가 아니라 화면에서만 어긋난다
+        // (실제로 12명 수동 목록 시절 신규 67명이 전부 무색이었다, 2026-08-12) — 빌드가
+        // 거부해서 로스터를 만들 때 걸리게 한다.
+        let ok = c.as_deref().is_some_and(|c| {
+            c.len() == 7
+                && c.starts_with('#')
+                && c[1..].chars().all(|h| h.is_ascii_hexdigit())
+        });
+        assert!(ok, "{json_path}: \"{n}\" 의 header_color 가 없거나 #RRGGBB 가 아니다: {c:?}");
+    }
+    for i in 0..rows.len() {
+        for j in (i + 1)..rows.len() {
+            assert_ne!(
+                rows[i].1, rows[j].1,
+                "{json_path}: 슬러그 \"{}\" 가 겹친다({} · {}) — 두 학생이 같은 inbox 를 \
+                 쓰게 되고 그건 오류 없이 어긋난다",
+                rows[i].1, rows[i].0, rows[j].0
+            );
+            assert_ne!(
+                rows[i].0, rows[j].0,
+                "{json_path}: 이름 \"{}\" 가 겹친다 — 화면에서 누가 누군지 사라진다",
+                rows[i].0
+            );
+        }
+    }
+
+    let mut out = String::from(
+        "// @generated by build.rs from collab-hooks/characters.json — 손으로 고치지 마라.\n\
+         pub(crate) const CHARACTER_SLUGS: &[(&str, &str)] = &[\n",
+    );
+    for (n, s, _) in &rows {
+        out.push_str(&format!("    ({n:?}, {s:?}),\n"));
+    }
+    out.push_str("];\n");
+    // 이름 → 고정 accent(0xRRGGBB). theme::character_accent 가 읽는다 — 로스터의
+    // header_color 가 정본이고, theme.rs 의 수동 12명 목록은 이 값과 동일했다.
+    out.push_str("pub(crate) const CHARACTER_ACCENTS: &[(&str, u32)] = &[\n");
+    for (n, _, c) in &rows {
+        let hex = &c.as_deref().unwrap()[1..];
+        out.push_str(&format!("    ({n:?}, 0x{hex}),\n"));
+    }
+    out.push_str("];\n");
+
+    let dst = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("character_slugs.rs");
+    std::fs::write(&dst, out).unwrap_or_else(|e| panic!("{} 를 못 썼다: {e}", dst.display()));
+}
+
+/// `"key": "value",` 한 줄에서 값만 꺼낸다. 값에 `"` 가 들어간 캐릭터는 없다(이름과
+/// 슬러그뿐이다) — persona 처럼 긴 문장은 여기서 안 본다.
+fn field(line: &str, key: &str) -> Option<String> {
+    let rest = line.strip_prefix(key)?.trim();
+    let inner = rest.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(inner[..end].to_string())
+}
+
+/// 마지막 릴리스 태그에서 몇 커밋 앞인가. 태그 위에 정확히 서 있으면 `0`.
+///
+/// 태그가 하나도 없거나 git 이 없으면 **빈 값**을 준다. 그 자리에서 화면은 릴리스로
+/// 취급한다 — 판정 근거가 없는 곳(소스 배포·tarball)에서 「내 빌드」라고 우기면
+/// 그것도 똑같이 근거 없는 말이라서다.
+fn git_ahead() -> Option<String> {
+    let out = Command::new("git").args(["describe", "--tags", "--long"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // `v0.1.19-750-g98d3f25c` — `--long` 은 태그 위에 서 있어도 `-0-g…` 를 붙여
+    // 형태를 하나로 만든다(그냥 `--describe` 는 그 경우 `v0.1.19` 만 준다).
+    let desc = String::from_utf8(out.stdout).ok()?;
+    let (head, _) = desc.trim().rsplit_once("-g")?;
+    let (_, n) = head.rsplit_once('-')?;
+    n.parse::<u32>().ok().map(|n| n.to_string())
+}
+
+/// HEAD 커밋의 시각 `MM-DD HH:MM`. 해시는 사람이 못 읽지만 시각은 읽는다 —
+/// 「아까 구운 게 이건가」가 이 화면에 오는 유일한 질문이다.
+fn git_date() -> Option<String> {
+    let out = Command::new("git")
+        .args(["log", "-1", "--format=%cd", "--date=format:%m-%d %H:%M"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+fn git_rev() -> Option<String> {
+    let short = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !short.status.success() {
+        return None;
+    }
+    let mut rev = String::from_utf8(short.stdout).ok()?.trim().to_string();
+    if rev.is_empty() {
+        return None;
+    }
+    // Dirty working tree → trailing '+'.
+    if let Ok(status) = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+    {
+        if status.status.success() && !status.stdout.is_empty() {
+            rev.push('+');
+        }
+    }
+    Some(rev)
+}

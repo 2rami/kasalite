@@ -1,0 +1,8032 @@
+//! wgpu 본창 안에서 그리는 설정 방.
+//!
+//! 페인터는 파일이나 HTTP를 읽지 않는다. 열 때와 파일을 바꾸는 액션 뒤에 만든
+//! 캐시와 `App`의 메모리 값만 스냅샷으로 받아, 렌더 중 I/O와 재차용을 함께 막는다.
+
+use super::*;
+
+pub(crate) type Rect = (f32, f32, f32, f32);
+
+/// 페이지 이름이 앉는 머리 칸. 이름은 `ay + 26` 에 20pt 로 그려지고 본문은 이
+/// 칸 아래 14px 에서 시작하므로, 이 값이 곧 **이름과 첫 묶음 제목 사이의 공백**을
+/// 정한다. 64 일 때 그 사이가 63px 로 벌어져 묶음 제목–첫 행 간격(25px)의 2.5배가
+/// 됐다 — 이름만 위에 떠 보인다(2026-09-22 실측). 44 면 43px 로, 이름이 묶음보다
+/// 큰 단위라는 것은 남기면서 떨어져 보이지는 않는다. 아래로는 본문이 스크롤해
+/// 지나가므로 이름 밑에 14px 는 남긴다.
+const HEADER_H: f32 = 44.0;
+/// 플랫 행 한 줄 높이(목업 `.row` min-height 40).
+const ROW_H: f32 = 40.0;
+/// 조작 부품 높이(목업 `.ctl` 26).
+const CTL_H: f32 = 26.0;
+const CONTENT_MAX_W: f32 = 800.0;
+
+/// 읽기 열의 가로 자리 — `(x, 폭)`.
+///
+/// 열은 `CONTENT_MAX_W` 에서 자라기를 멈추므로, 창이 그보다 넓어지면 남는 폭이
+/// **전부 오른쪽에 쌓인다**. 2560 창에서 본문 오른쪽이 1026px(창 폭의 40%) 비어
+/// 글이 왼쪽 벽에 붙어 보였다(2026-09-22 실측). 남는 만큼을 좌우로 나눠 세운다.
+/// 좁은 창은 열이 남는 폭을 다 쓰므로 나눌 것이 없어 예전 배치 그대로다.
+fn content_column(ax: f32, aw: f32, nav_w: f32) -> (f32, f32) {
+    let gutter = if aw < 760.0 { 20.0 } else { 28.0 };
+    let avail = (aw - nav_w - gutter * 2.0).max(180.0);
+    let w = avail.min(CONTENT_MAX_W);
+    (ax + nav_w + gutter + ((avail - w) * 0.5).floor(), w)
+}
+const SPRITE_DROP_MAX_BYTES: u64 = 4 << 20;
+const THEMEGEN_DROP_MAX_BYTES: u64 = 32 << 20;
+
+#[derive(Clone)]
+pub(crate) struct PaletteChoice {
+    pub(crate) key: String,
+    pub(crate) label: String,
+    pub(crate) bg: [u8; 4],
+    pub(crate) text: [u8; 4],
+    ansi: [[u8; 3]; 6],
+}
+
+#[derive(Clone)]
+pub(crate) struct CharacterChoice {
+    name: String,
+    slug: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct CustomThemeChoice {
+    slug: String,
+    label: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct AccountChoice {
+    /// 그 슬롯의 이메일. 부제 문자열은 조직명일 수도 있어 거기서 되뽑으면
+    /// 도메인 표를 못 그린다.
+    pub(crate) email: String,
+    provider: AccountProvider,
+    id: String,
+    name: String,
+    sub: String,
+    sub_kind: &'static str,
+    active: bool,
+    slot: bool,
+    usage: Option<UsageBadge>,
+    /// 상세에 그릴 창 전부. Codex의 이름 달린 추가 bucket은 대표 사용률로
+    /// 승격하지 않고 여기에서만 보인다.
+    usage_windows: Vec<crate::UsageWindowBadge>,
+    usage_state: AccountUsageState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountUsageState {
+    Ready,
+    Loading,
+    Failed,
+    LoggedOut,
+}
+
+/// 본진(홈 기계)의 계정 칸. 이 값이 있으면 계정 화면은 **그 기계 것**을 그린다.
+///
+/// 학생이 본진에서 태어나는 동안 계정을 이 기계에 등록해 봐야 아무 일도 안 난다 —
+/// 한도가 차는 곳과 등록되는 곳이 달라서다. 화면이 어느 기계를 다루는지 항상
+/// 보이게 이름을 함께 싣는다.
+#[derive(Clone)]
+pub(crate) struct HomeAccountsView {
+    pub(crate) label: String,
+    pub(crate) accounts: Arc<Vec<AccountChoice>>,
+    pub(crate) autoswitch: bool,
+    pub(crate) autoswitch_pct: f32,
+    /// `(슬롯 id, 상태, 실패 이유)` — 상태는 `running`·`need_code`·`ok`·`error`.
+    pub(crate) login: Option<(String, String, Option<String>)>,
+    /// 아직 한 번도 못 읽었거나 마지막 조회가 실패한 이유.
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SettingsCache {
+    pub(crate) ready: bool,
+    pub(crate) palettes: Arc<Vec<PaletteChoice>>,
+    characters: Arc<Vec<CharacterChoice>>,
+    themes: Arc<Vec<socket::ThemeRow>>,
+    models: Arc<Vec<kasa_mcp::character::ModelChoice>>,
+    roster: Option<serde_json::Value>,
+    open_apps: Arc<Vec<(String, String)>>,
+    character_theme: String,
+    language: String,
+    system_light: String,
+    system_dark: String,
+    custom_themes: Arc<Vec<CustomThemeChoice>>,
+    custom_active: String,
+    palette_hex: Arc<Vec<String>>,
+    pub(crate) device_colors: Arc<Vec<crate::render::pane_identity::DeviceColorRow>>,
+    theme_rosters: Arc<std::collections::HashMap<String, Vec<CharacterChoice>>>,
+    ordered_picks: Arc<Vec<(String, Vec<String>)>>,
+    accounts: Arc<Vec<AccountChoice>>,
+    themegen_providers: Arc<Vec<crate::themegen::ProviderStatus>>,
+    themegen_provider: String,
+    themegen_key_masked: String,
+    themegen_refs: Arc<std::collections::HashSet<String>>,
+}
+
+impl std::fmt::Debug for SettingsCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsCache")
+            .field("ready", &self.ready)
+            .field("palettes", &self.palettes.len())
+            .field("characters", &self.characters.len())
+            .field("themes", &self.themes.len())
+            .field("models", &self.models.len())
+            .field("open_apps", &self.open_apps.len())
+            .field("theme_rosters", &self.theme_rosters.len())
+            .field("accounts", &self.accounts.len())
+            .finish()
+    }
+}
+
+impl SettingsCache {
+    pub(crate) fn refresh(&mut self) {
+        let saved = socket::read_settings();
+        self.refresh_palette_from(&saved);
+        let roster = kasa_mcp::character::characters_json();
+        let characters = roster
+            .as_ref()
+            .map(|value| {
+                kasa_mcp::character::member_names(value)
+                    .into_iter()
+                    .map(|name| CharacterChoice {
+                        slug: kasa_mcp::character::member_def(value, &name)
+                            .and_then(|entry| entry.get("slug").and_then(|v| v.as_str()).map(str::to_string))
+                            .unwrap_or_else(|| theme::agent_slug(&name)),
+                        name,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let models = roster
+            .as_ref()
+            .map(kasa_mcp::character::model_choices)
+            .unwrap_or_default();
+
+        self.ready = true;
+        self.characters = Arc::new(characters);
+        self.themes = Arc::new(socket::theme_rows());
+        self.models = Arc::new(models);
+        self.roster = roster;
+        self.open_apps = Arc::new(proc::open_with_apps().to_vec());
+        self.character_theme = socket::read_character_theme();
+        self.language = socket::read_ui_language();
+
+        let mut theme_rosters = std::collections::HashMap::new();
+        self.ordered_picks = Arc::new(kasa_mcp::character::all_picks());
+        for row in self.themes.iter() {
+            let key = if row.id.is_empty() {
+                kasa_mcp::character::BASE_THEME_KEY.to_string()
+            } else {
+                row.id.clone()
+            };
+            let value = if row.id.is_empty() {
+                kasa_mcp::character::base_characters_json()
+            } else {
+                kasa_mcp::character::theme_characters_json(&row.id)
+            };
+            let members = value
+                .as_ref()
+                .map(|roster| {
+                    kasa_mcp::character::member_names(roster)
+                        .into_iter()
+                        .map(|name| CharacterChoice {
+                            slug: kasa_mcp::character::member_def(roster, &name)
+                                .and_then(|entry| entry.get("slug").and_then(|v| v.as_str()).map(str::to_string))
+                                .unwrap_or_else(|| theme::agent_slug(&name)),
+                            name,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            theme_rosters.insert(key, members);
+        }
+        self.theme_rosters = Arc::new(theme_rosters);
+
+        let settings = socket::read_settings();
+        self.themegen_provider = settings
+            .get("theme_gen_provider")
+            .and_then(|value| value.as_str())
+            .unwrap_or("opengateway")
+            .to_string();
+        self.themegen_key_masked = settings
+            .get("gemini_api_key")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(crate::themegen::mask_key)
+            .unwrap_or_default();
+        self.themegen_providers = Arc::new(crate::themegen::detect_providers());
+        let mut refs = std::collections::HashSet::new();
+        for (theme_id, roster) in self.theme_rosters.iter() {
+            if theme_id == kasa_mcp::character::BASE_THEME_KEY {
+                continue;
+            }
+            for character in roster {
+                if crate::settings::themegen_ref_info(theme_id, &character.slug).is_some() {
+                    refs.insert(format!("{theme_id}\0{}", character.slug));
+                }
+            }
+        }
+        self.themegen_refs = Arc::new(refs);
+    }
+
+    fn refresh_palette_from(&mut self, saved: &serde_json::Value) {
+        let mut palettes = Vec::new();
+        let system_key = theme::system_theme_key();
+        if let Some((_, label, palette)) = theme::THEME_PRESETS
+            .iter()
+            .find(|(key, _, _)| *key == system_key)
+        {
+            palettes.push(palette_choice(
+                "system",
+                &format!("System · {label}"),
+                palette,
+            ));
+        }
+        palettes.extend(
+            theme::THEME_PRESETS
+                .iter()
+                .map(|(key, label, palette)| palette_choice(key, label, palette)),
+        );
+        palettes.extend(theme::custom_themes(&saved).iter().map(|entry| {
+            let palette = theme::custom_palette(entry);
+            palette_choice(
+                &format!("custom:{}", theme::custom_slug(entry)),
+                &theme::custom_label(entry),
+                &palette,
+            )
+        }));
+
+        self.palettes = Arc::new(palettes);
+        self.system_light = theme::system_slot_theme(true);
+        self.system_dark = theme::system_slot_theme(false);
+        let customs = theme::custom_themes(&saved);
+        self.custom_active = theme::active_custom_slug().unwrap_or_default();
+        self.custom_themes = Arc::new(
+            customs
+                .iter()
+                .map(|entry| CustomThemeChoice {
+                    slug: theme::custom_slug(entry),
+                    label: theme::custom_label(entry),
+                })
+                .collect(),
+        );
+        self.palette_hex = Arc::new(crate::settings::palette_hex_list(
+            &saved,
+            (!self.custom_active.is_empty()).then_some(self.custom_active.as_str()),
+        ));
+        self.device_colors = Arc::new(crate::render::pane_identity::device_color_rows());
+    }
+
+    pub(crate) fn refresh_palette(&mut self) {
+        self.refresh_palette_from(&socket::read_settings());
+    }
+
+    pub(crate) fn set_accounts(&mut self, accounts: Vec<AccountChoice>) {
+        self.accounts = Arc::new(accounts);
+    }
+
+    pub(crate) fn language(&self) -> &str {
+        &self.language
+    }
+}
+
+fn palette_choice(key: &str, label: &str, palette: &theme::Palette) -> PaletteChoice {
+    let mut ansi = [[0, 0, 0]; 6];
+    ansi.copy_from_slice(&palette.ansi[1..7]);
+    PaletteChoice {
+        key: key.to_string(),
+        label: label.to_string(),
+        bg: palette.bg,
+        text: palette.text,
+        ansi,
+    }
+}
+
+fn account_usage_key(provider: AccountProvider, id: &str) -> String {
+    let provider = match provider {
+        AccountProvider::Claude => "claude",
+        AccountProvider::Codex => "codex",
+    };
+    format!("{provider}\0{id}")
+}
+
+fn account_usage_state(
+    logged_in: Option<bool>,
+    has_usage: bool,
+    attempted: Option<bool>,
+) -> AccountUsageState {
+    if logged_in == Some(false) {
+        AccountUsageState::LoggedOut
+    } else if attempted == Some(false) {
+        AccountUsageState::Failed
+    } else if has_usage || attempted == Some(true) {
+        AccountUsageState::Ready
+    } else {
+        AccountUsageState::Loading
+    }
+}
+
+fn codex_window_label(minutes: u32) -> String {
+    match minutes {
+        m if m > 0 && m % (60 * 24) == 0 => format!("{}d", m / (60 * 24)),
+        m if m > 0 && m % 60 == 0 => format!("{}h", m / 60),
+        m if m > 0 => format!("{m}m"),
+        _ => String::new(),
+    }
+}
+
+fn codex_usage_windows(limits: &crate::codexlimits::CodexLimits) -> Vec<crate::UsageWindowBadge> {
+    let mut windows: Vec<crate::UsageWindowBadge> = limits
+        .windows
+        .iter()
+        .filter_map(|(minutes, pct, resets_at)| {
+            let label = codex_window_label(*minutes);
+            (!label.is_empty()).then(|| crate::UsageWindowBadge {
+                label,
+                pct: *pct,
+                resets_at: resets_at.and_then(|at| u64::try_from(at).ok()),
+            })
+        })
+        .collect();
+    windows.extend(limits.named_windows.iter().filter_map(|window| {
+        let duration = codex_window_label(window.minutes);
+        (!duration.is_empty()).then(|| crate::UsageWindowBadge {
+            label: format!("{duration} {}", window.name),
+            pct: window.pct,
+            resets_at: window.resets_at.and_then(|at| u64::try_from(at).ok()),
+        })
+    }));
+    windows
+}
+
+fn codex_usage_badge(id: &str, limits: &crate::codexlimits::CodexLimits) -> Option<UsageBadge> {
+    let pressure = limits
+        .windows
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    Some(UsageBadge {
+        pct: pressure.1,
+        label: codex_window_label(pressure.0),
+        stale: limits.stale,
+        account_dir: id.to_string(),
+        resets_at: pressure.2.and_then(|at| u64::try_from(at).ok()),
+        windows: codex_usage_windows(limits),
+    })
+}
+
+fn account_choices(app: &App) -> Vec<AccountChoice> {
+    let active_id = app.set_claude_account.clone();
+    let mut rows = Vec::new();
+
+    for (index, account) in app.set_claude_accounts.iter().filter(|account| !account.id.is_empty()).enumerate() {
+        let probe = crate::settings::auth_probe(&account.id);
+        let sub = probe
+            .as_ref()
+            .map(|value| {
+                if !value.verified {
+                    if value.email.is_empty() { "로그인 확인 중…".to_string() } else { format!("{} · 로그인 확인 중…", value.email) }
+                } else if value.logged_in {
+                    account_sub(&value.email, &value.org)
+                } else {
+                    "로그인 필요".to_string()
+                }
+            })
+            .unwrap_or_else(|| "확인 중…".to_string());
+        let dir = crate::claude_auth::runtime_dir_for_cached(&account.id, &active_id)
+            .map_or(String::new(), |path| path.to_string_lossy().into_owned());
+        let usage = app.claude_account_usage(&account.id);
+        let usage_state = match crate::settings::claude_usage_state(
+            probe.as_ref().filter(|value| value.verified).map(|value| value.logged_in),
+            usage.as_ref(),
+            crate::handler::claude_usage_attempt(&dir),
+        ) {
+            "logged_out" => AccountUsageState::LoggedOut,
+            "failed" => AccountUsageState::Failed,
+            "ready" => AccountUsageState::Ready,
+            _ => AccountUsageState::Loading,
+        };
+        let usage_windows = usage
+            .as_ref()
+            .map(|badge| badge.windows.clone())
+            .unwrap_or_default();
+        rows.push(AccountChoice {
+            email: probe.as_ref().map(|p| p.email.clone()).unwrap_or_default(),
+            provider: AccountProvider::Claude,
+            id: account.id.clone(),
+            name: crate::settings::account_display(
+                &account.id,
+                &account.label,
+                &format!("계정 {}", index + 1),
+            ),
+            sub,
+            sub_kind: match probe {
+                Some(ref value) if value.verified && !value.logged_in => "danger",
+                Some(_) => "mute",
+                None => "faint",
+            },
+            active: account.id == active_id,
+            slot: true,
+            usage,
+            usage_windows,
+            usage_state,
+        });
+    }
+
+    let default_codex_logged_in = crate::settings::codex_logged_in("")
+        || crate::codexlimits::seeded_for_probe("");
+    let default_codex_limits = crate::codexlimits::snapshot_for("");
+    let default_codex_usage = default_codex_limits
+        .as_ref()
+        .and_then(|limits| codex_usage_badge("", limits));
+    let default_codex_windows = default_codex_limits
+        .as_ref()
+        .map(codex_usage_windows)
+        .unwrap_or_default();
+    rows.push(AccountChoice {
+        email: crate::settings::codex_identity("").unwrap_or_default(),
+        provider: AccountProvider::Codex,
+        id: String::new(),
+        name: "기본 로그인".to_string(),
+        sub: crate::settings::codex_identity("").unwrap_or_else(|| {
+            if default_codex_logged_in {
+                "로그인됨".to_string()
+            } else {
+                "로그인 필요".to_string()
+            }
+        }),
+        sub_kind: if default_codex_logged_in { "mute" } else { "danger" },
+        active: app.set_codex_account.is_empty(),
+        slot: false,
+        usage_state: account_usage_state(
+            Some(default_codex_logged_in),
+            default_codex_limits.is_some(),
+            crate::codexlimits::attempted_for("").then_some(false),
+        ),
+        usage: default_codex_usage,
+        usage_windows: default_codex_windows,
+    });
+    for (index, account) in app.set_codex_accounts.iter().enumerate() {
+        let identity = crate::settings::codex_identity(&account.id);
+        let logged_in = crate::settings::codex_logged_in(&account.id)
+            || crate::codexlimits::seeded_for_probe(&account.id);
+        let limits = crate::codexlimits::snapshot_for(&account.id);
+        let usage = limits
+            .as_ref()
+            .and_then(|limits| codex_usage_badge(&account.id, limits));
+        let usage_windows = limits
+            .as_ref()
+            .map(codex_usage_windows)
+            .unwrap_or_default();
+        rows.push(AccountChoice {
+            email: identity.clone().unwrap_or_default(),
+            provider: AccountProvider::Codex,
+            id: account.id.clone(),
+            name: if account.label.trim().is_empty() {
+                identity.clone().unwrap_or_else(|| format!("계정 {}", index + 2))
+            } else {
+                account.label.clone()
+            },
+            sub: if account.label.trim().is_empty() {
+                String::new()
+            } else {
+                identity.unwrap_or_else(|| {
+                    if logged_in {
+                        "로그인됨".to_string()
+                    } else {
+                        "로그인 필요".to_string()
+                    }
+                })
+            },
+            sub_kind: if logged_in { "mute" } else { "danger" },
+            active: account.id == app.set_codex_account,
+            slot: true,
+            usage_state: account_usage_state(
+                Some(logged_in),
+                limits.is_some(),
+                crate::codexlimits::attempted_for(&account.id).then_some(false),
+            ),
+            usage,
+            usage_windows,
+        });
+    }
+    rows
+}
+
+fn account_sub(email: &str, org: &str) -> String {
+    let personal = format!("{email}'s Organization");
+    if !org.is_empty() && org != personal {
+        format!("{email} · {org}")
+    } else {
+        email.to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HitCursor {
+    Pointer,
+    Text,
+    /// 보통 화살표 — 「바깥을 눌러 닫기」처럼 누를 수는 있지만 손가락은 아닌 자리.
+    Arrow,
+}
+
+/// 펼쳐지는 선택 상자. 한 번에 하나만 열린다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DropdownId {
+    UiFont,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Target {
+    Category(SettingsCat),
+    /// 선택 상자 머리 — 누르면 펼치고, 다시 누르면 닫는다.
+    Dropdown(DropdownId),
+    /// 펼친 선택 상자 바깥 — 누르면 닫기만 한다.
+    DropdownDismiss,
+    Setting(SettingsAction),
+    Focus(SettingsInput),
+    AccountUsage(String),
+    Close,
+    Onboarding(crate::native_onboarding::Action),
+}
+
+#[derive(Clone)]
+pub(crate) struct Hit {
+    pub(crate) target: Target,
+    pub(crate) rect: Rect,
+    pub(crate) cursor: HitCursor,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FieldBackup {
+    pub(crate) field: SettingsInput,
+    pub(crate) value: String,
+    pub(crate) caret: usize,
+}
+
+impl std::fmt::Debug for Hit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hit")
+            .field("rect", &self.rect)
+            .field("cursor", &self.cursor)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct PaintOutput {
+    pub(crate) hits: Vec<Hit>,
+    /// 펼친 선택 상자 목록의 최대 스크롤.
+    pub(crate) dropdown_scroll_max: f32,
+    pub(crate) content_h: f32,
+    pub(crate) view_h: f32,
+    pub(crate) caret_rect: Option<Rect>,
+    pub(crate) multiline_layouts: Vec<MultilineLayout>,
+    pub(crate) motion_preview_visible: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VisualRow {
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+    /// 각 caret 경계의 실제 GPU 측정 x 좌표(필드 안 상대좌표).
+    pub(crate) caret_xs: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MultilineLayout {
+    pub(crate) field: SettingsInput,
+    pub(crate) rect: Rect,
+    pub(crate) rows: Vec<VisualRow>,
+    pub(crate) first_line: usize,
+    pub(crate) visible_lines: usize,
+}
+
+#[derive(Default)]
+struct PaintFeedback {
+    multiline_layouts: Vec<MultilineLayout>,
+    motion_preview_visible: bool,
+    /// 이번 프레임에 그린 「펼쳐진」 선택 상자의 머리 자리. 팝업은 본문을 다 그린 뒤
+    /// 이 자리에 붙여 맨 위에 올린다.
+    dropdown_anchor: Option<(DropdownId, Rect)>,
+}
+
+thread_local! {
+    static PAINT_FEEDBACK: std::cell::RefCell<PaintFeedback> = Default::default();
+}
+
+fn begin_paint_feedback() {
+    PAINT_FEEDBACK.with(|feedback| *feedback.borrow_mut() = PaintFeedback::default());
+}
+
+fn push_multiline_layout(layout: MultilineLayout) {
+    PAINT_FEEDBACK.with(|feedback| feedback.borrow_mut().multiline_layouts.push(layout));
+}
+
+fn mark_dropdown_anchor(id: DropdownId, rect: Rect) {
+    PAINT_FEEDBACK.with(|feedback| feedback.borrow_mut().dropdown_anchor = Some((id, rect)));
+}
+
+fn mark_motion_preview_visible() {
+    PAINT_FEEDBACK.with(|feedback| feedback.borrow_mut().motion_preview_visible = true);
+}
+
+fn take_paint_feedback() -> PaintFeedback {
+    PAINT_FEEDBACK.with(|feedback| std::mem::take(&mut *feedback.borrow_mut()))
+}
+
+pub(crate) struct Snapshot {
+    pub(crate) area: Rect,
+    pub(crate) cat: SettingsCat,
+    pub(crate) cursor: (f32, f32),
+    pub(crate) scroll: f32,
+    pub(crate) caret_on: bool,
+    pub(crate) input: Option<SettingsInput>,
+    pub(crate) select_all: bool,
+    pub(crate) preedit: String,
+    pub(crate) first_run: bool,
+    pub(crate) language: String,
+    pub(crate) cwd_mode: String,
+    pub(crate) file_open_mode: String,
+    pub(crate) file_open_app: String,
+    pub(crate) file_open_cmd: String,
+    pub(crate) file_tree_default: bool,
+    pub(crate) footer_default: bool,
+    pub(crate) autosave_ms: u64,
+    pub(crate) shell: String,
+    pub(crate) theme: String,
+    pub(crate) system_light: String,
+    pub(crate) system_dark: String,
+    pub(crate) custom_themes: Arc<Vec<CustomThemeChoice>>,
+    pub(crate) custom_active: String,
+    pub(crate) custom_theme_label_edit: Option<(String, String)>,
+    pub(crate) palette_hex: Arc<Vec<String>>,
+    pub(crate) device_colors: Arc<Vec<crate::render::pane_identity::DeviceColorRow>>,
+    pub(crate) palette_edit: String,
+    pub(crate) picker_hsv: (f32, f32, f32),
+    pub(crate) eyedropper: bool,
+    pub(crate) accent: String,
+    pub(crate) shape: String,
+    pub(crate) min_contrast: f32,
+    /// 크롬 글꼴 설정값("" 은 터미널 글꼴).
+    pub(crate) ui_font: String,
+    /// 설치돼 있어 고를 수 있는 UI 글꼴 이름들.
+    pub(crate) ui_fonts: Vec<String>,
+    /// 지금 펼쳐진 선택 상자.
+    pub(crate) dropdown: Option<DropdownId>,
+    pub(crate) dropdown_scroll: f32,
+    pub(crate) font_size: f32,
+    pub(crate) ui_zoom: f32,
+    pub(crate) wheel_gain: f32,
+    pub(crate) status_h: f32,
+    pub(crate) footer_h: f32,
+    pub(crate) tabs_on_top: bool,
+    pub(crate) cursor_shape: cursor::CursorShape,
+    pub(crate) cursor_thickness: f32,
+    pub(crate) cursor_color: [u8; 4],
+    pub(crate) mouse_cursor: String,
+    pub(crate) statusbar_order: Vec<String>,
+    pub(crate) statusbar_hidden: std::collections::HashSet<String>,
+    pub(crate) statusbar_colors: std::collections::HashMap<String, String>,
+    pub(crate) statusbar_usage_fields: std::collections::HashMap<String, Vec<String>>,
+    pub(crate) statusbar_separators: bool,
+    pub(crate) claude_persona: bool,
+    pub(crate) shim_inject: bool,
+    pub(crate) claude_model: String,
+    pub(crate) claude_effort: String,
+    pub(crate) claude_extra: String,
+    pub(crate) account_autoswitch: bool,
+    pub(crate) account_autoswitch_pct: f32,
+    pub(crate) accounts: Arc<Vec<AccountChoice>>,
+    pub(crate) account_usage_expanded: std::collections::HashSet<String>,
+    pub(crate) account_label_edit: Option<(AccountProvider, String, String)>,
+    pub(crate) machine_edit: Option<(usize, bool, String)>,
+    pub(crate) login_job: Option<crate::settings::LoginJob>,
+    /// 로그인이 코드를 기다릴 때 그 칸에 든 값.
+    pub(crate) login_code: String,
+    /// 본진이 살아 있으면 그 기계의 계정 칸. 「본진」 칸을 골랐을 때 쓴다.
+    pub(crate) home_accounts: Option<HomeAccountsView>,
+    /// 계정 칸이 지금 다루는 기계 — `true` = 본진.
+    pub(crate) account_scope_home: bool,
+    pub(crate) palettes: Arc<Vec<PaletteChoice>>,
+    pub(crate) themes: Arc<Vec<socket::ThemeRow>>,
+    pub(crate) theme_rosters: Arc<std::collections::HashMap<String, Vec<CharacterChoice>>>,
+    pub(crate) ordered_picks: Arc<Vec<(String, Vec<String>)>>,
+    pub(crate) inspected_theme: Option<String>,
+    pub(crate) theme_label_edit: Option<(String, String)>,
+    pub(crate) character_theme: String,
+    pub(crate) open_apps: Arc<Vec<(String, String)>>,
+    pub(crate) student_selected: Option<String>,
+    pub(crate) student_theme: String,
+    pub(crate) student_slug: String,
+    pub(crate) student_name: String,
+    pub(crate) student_persona: String,
+    pub(crate) student_caret: usize,
+    pub(crate) student_model: String,
+    pub(crate) student_backend: String,
+    pub(crate) student_raw_open: bool,
+    pub(crate) student_raw_yaml: bool,
+    pub(crate) student_raw_text: String,
+    pub(crate) student_raw_caret: usize,
+    pub(crate) student_raw_error: Option<String>,
+    pub(crate) models: Arc<Vec<kasa_mcp::character::ModelChoice>>,
+    pub(crate) settings_caret: usize,
+    pub(crate) feedback_body: String,
+    pub(crate) feedback_caret: usize,
+    pub(crate) feedback_diag: bool,
+    pub(crate) feedback_diag_line: String,
+    pub(crate) themegen_providers: Arc<Vec<crate::themegen::ProviderStatus>>,
+    pub(crate) themegen_provider: String,
+    pub(crate) themegen_key_masked: String,
+    pub(crate) themegen_key_edit: String,
+    pub(crate) themegen_has_ref: bool,
+    pub(crate) themegen_phase: Option<crate::themegen::GenPhase>,
+    pub(crate) sprite_slot: Option<(String, usize)>,
+    pub(crate) media: Arc<crate::settings_media::SettingsMediaCache>,
+    pub(crate) media_elapsed: std::time::Duration,
+    pub(crate) onboarding: crate::native_onboarding::Snapshot,
+}
+
+impl App {
+    pub(crate) fn refresh_native_settings_media_cache(&mut self) {
+        let mut plan = crate::settings_media::MediaPlan::new();
+        {
+            let cache = self.settings_scene.cache();
+            match self.settings_scene.category() {
+                SettingsCat::Theme => {
+                    plan.include_theme_cards(&cache.themes);
+                    if let Some(theme_id) = self.settings_scene.inspected_theme() {
+                        let key = if theme_id.is_empty() {
+                            kasa_mcp::character::BASE_THEME_KEY
+                        } else {
+                            theme_id
+                        };
+                        if let Some(roster) = cache.theme_rosters.get(key) {
+                            plan.include_student_faces(
+                                theme_id,
+                                roster.iter().map(|character| character.slug.as_str()),
+                            );
+                        }
+                    }
+                }
+                SettingsCat::Students if self.students_selected.is_none() => {
+                    for row in cache.themes.iter() {
+                        let key = if row.id.is_empty() { kasa_mcp::character::BASE_THEME_KEY } else { &row.id };
+                        if let Some(roster) = cache.theme_rosters.get(key) {
+                            plan.include_student_faces(&row.id, roster.iter().map(|c| c.slug.as_str()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.settings_scene.category() == SettingsCat::Students
+            && self.students_selected.is_some()
+            && !self.students_slug.is_empty()
+        {
+            plan.include_student_detail(&self.students_theme, &self.students_slug);
+        }
+        self.settings_scene.refresh_media_cache(&plan);
+    }
+
+    pub(crate) fn reload_native_settings_media_cache(&mut self) {
+        self.settings_scene.invalidate_media_cache();
+        self.refresh_native_settings_media_cache();
+    }
+
+    pub(crate) fn settings_media_animating(&self) -> bool {
+        if !motion_preview_pump_needed(
+            self.settings_room_active(),
+            self.students_selected.is_some() && !self.students_slug.is_empty(),
+            self.settings_scene.motion_preview_visible(),
+        ) {
+            return false;
+        }
+        let elapsed = self.settings_scene.media_elapsed();
+        ["idle", "walk", "wave", "cheer", "gif"].iter().any(|motion| {
+            self.settings_scene
+                .media()
+                .next_motion_frame_in(
+                    &self.students_theme,
+                    &self.students_slug,
+                    motion,
+                    elapsed,
+                )
+                .is_some()
+        })
+    }
+
+    /// 계정 신원/한도는 렌더 스냅샷에서 조회하지 않는다. 이 함수는 event-loop의
+    /// 느린 틱에서만 캐시를 갱신하므로 auth probe가 자식 프로세스를 띄우더라도
+    /// 프레임마다 반복되지 않는다.
+    pub(crate) fn refresh_native_settings_dynamic_cache(&mut self) {
+        if !self.settings_room_active() {
+            return;
+        }
+        let accounts = account_choices(self);
+        self.settings_scene.set_account_cache(accounts);
+    }
+
+    pub(crate) fn native_settings_tick(&mut self) {
+        if self.settings_room_active() {
+            self.pump_autosettings_scroll();
+        }
+        if self.settings_room_active() && self.settings_scene.dynamic_refresh_due() {
+            self.refresh_native_settings_dynamic_cache();
+            self.chrome_dirty = true;
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
+    pub(crate) fn native_settings_snapshot(&self, area: Rect) -> Option<Snapshot> {
+        if !self.settings_room_active() {
+            return None;
+        }
+        let scene = &self.settings_scene;
+        let cache = scene.cache();
+        let cursor_color = self
+            .ws
+            .lock()
+            .ok()
+            .and_then(|ws| {
+                let outer = scene.return_pane()?;
+                let tab_pid = ws.active_tab_pid(outer);
+                let name = ws.pane_character.get(&tab_pid)?;
+                theme::character_accent_n(
+                    name,
+                    theme::character_ordinal(&ws.pane_character, &tab_pid),
+                )
+            })
+            .unwrap_or_else(theme::cursor);
+        Some(Snapshot {
+            area,
+            cat: scene.category(),
+            cursor: self.cursor_px,
+            scroll: scene.scroll(),
+            caret_on: self.last_blink_on,
+            input: self.settings_input,
+            select_all: scene.field_select_all(),
+            preedit: self.preedit.clone(),
+            first_run: scene.first_run(),
+            language: cache.language.clone(),
+            cwd_mode: self.set_cwd_mode.clone(),
+            file_open_mode: self.set_file_open_mode.clone(),
+            file_open_app: self.set_file_open_app.clone(),
+            file_open_cmd: self.set_file_open_cmd.clone(),
+            file_tree_default: self.set_file_tree_default,
+            footer_default: self.set_footer_default,
+            autosave_ms: self.set_autosave.map_or(0, |d| d.as_millis() as u64),
+            shell: self.set_shell.clone(),
+            theme: theme::theme_name(),
+            system_light: cache.system_light.clone(),
+            system_dark: cache.system_dark.clone(),
+            custom_themes: cache.custom_themes.clone(),
+            custom_active: cache.custom_active.clone(),
+            custom_theme_label_edit: self.custom_theme_label_edit.clone(),
+            palette_hex: cache.palette_hex.clone(),
+            device_colors: cache.device_colors.clone(),
+            palette_edit: self.set_palette_edit.clone(),
+            picker_hsv: self.set_picker_hsv,
+            eyedropper: crate::eyedropper::supported(),
+            accent: theme::accent_name().to_string(),
+            shape: theme::shape_name().to_string(),
+            min_contrast: theme::min_contrast(),
+            ui_font: theme::ui_font(),
+            ui_fonts: crate::onboarding::ui_font_families(),
+            font_size: self.font_size,
+            ui_zoom: self.ui_zoom,
+            wheel_gain: self.set_wheel_pixel_gain,
+            status_h: self.set_status_h,
+            footer_h: self.set_pane_footer_h,
+            tabs_on_top: self.tabs_on_top,
+            cursor_shape: self.cursor_shape,
+            cursor_thickness: self.cursor_thickness,
+            cursor_color,
+            mouse_cursor: self.mouse_cursor.clone(),
+            statusbar_order: self.set_statusbar.order.clone(),
+            statusbar_hidden: self.set_statusbar.hidden.clone(),
+            statusbar_colors: self.set_statusbar.colors.clone(),
+            statusbar_usage_fields: self.set_statusbar.usage_fields.clone(),
+            statusbar_separators: self.set_statusbar.separators,
+            claude_persona: self.set_claude_persona,
+            shim_inject: self.set_shim_inject,
+            claude_model: self.set_claude_model.clone(),
+            claude_effort: self.set_claude_effort.clone(),
+            claude_extra: self.set_claude_extra.clone(),
+            account_autoswitch: self.set_account_autoswitch,
+            account_autoswitch_pct: self.set_account_autoswitch_pct,
+            accounts: cache.accounts.clone(),
+            account_usage_expanded: scene.account_usage_expanded().clone(),
+            dropdown: scene.dropdown(),
+            dropdown_scroll: scene.dropdown_scroll(),
+            account_label_edit: self.account_label_edit.clone(),
+            machine_edit: self.machine_edit.clone(),
+            login_job: crate::settings::hidden_login_job(),
+            login_code: self.login_code_edit.clone(),
+            home_accounts: home_accounts_view(),
+            account_scope_home: self.set_account_scope_home,
+            palettes: cache.palettes.clone(),
+            themes: cache.themes.clone(),
+            theme_rosters: cache.theme_rosters.clone(),
+            ordered_picks: cache.ordered_picks.clone(),
+            inspected_theme: scene.inspected_theme().map(str::to_string),
+            theme_label_edit: self.theme_label_edit.clone(),
+            character_theme: cache.character_theme.clone(),
+            open_apps: cache.open_apps.clone(),
+            student_selected: self.students_selected.clone(),
+            student_theme: self.students_theme.clone(),
+            student_slug: self.students_slug.clone(),
+            student_name: self.students_name.clone(),
+            student_persona: self.students_persona.clone(),
+            student_caret: self.students_caret,
+            student_model: self.students_model.clone(),
+            student_backend: self.students_backend.clone(),
+            student_raw_open: self.students_raw.open,
+            student_raw_yaml: self.students_raw.yaml,
+            student_raw_text: self.students_raw.text.clone(),
+            student_raw_caret: self.students_raw.caret,
+            student_raw_error: self.students_raw.err.clone(),
+            models: cache.models.clone(),
+            settings_caret: self.settings_caret,
+            feedback_body: self.feedback_body.clone(),
+            feedback_caret: self.feedback_caret,
+            feedback_diag: self.feedback_diag,
+            feedback_diag_line: crate::settings::diag_line(),
+            themegen_providers: cache.themegen_providers.clone(),
+            themegen_provider: cache.themegen_provider.clone(),
+            themegen_key_masked: cache.themegen_key_masked.clone(),
+            themegen_key_edit: self.themegen.key_edit.clone(),
+            themegen_has_ref: cache
+                .themegen_refs
+                .contains(&format!("{}\0{}", self.students_theme, self.students_slug)),
+            themegen_phase: (!self.students_slug.is_empty())
+                .then(|| self.themegen_view(&self.students_slug))
+                .flatten()
+                .map(|view| view.phase),
+            sprite_slot: scene
+                .sprite_slot()
+                .map(|(motion, frame)| (motion.to_string(), frame)),
+            media: scene.media(),
+            media_elapsed: scene.media_elapsed(),
+            onboarding: crate::native_onboarding::snapshot(self, area),
+        })
+    }
+
+    pub(crate) fn finish_native_settings_paint(&mut self, output: PaintOutput) {
+        self.settings_scene.finish_paint(
+            output.hits,
+            output.dropdown_scroll_max,
+            output.content_h,
+            output.view_h,
+            output.caret_rect,
+            output.multiline_layouts,
+            output.motion_preview_visible,
+        );
+        if let (Some(window), Some((x, y, w, h))) =
+            (self.window.as_ref(), self.settings_scene.caret_rect())
+        {
+            window.set_ime_cursor_area(
+                winit::dpi::LogicalPosition::new(x as f64, y as f64),
+                winit::dpi::LogicalSize::new(w.max(1.0) as f64, h.max(1.0) as f64),
+            );
+        }
+    }
+
+    pub(crate) fn native_settings_contains(&self, x: f32, y: f32) -> bool {
+        self.settings_room_active()
+            && self.window.as_ref().is_some_and(|w| {
+                let s = self.effective_scale();
+                let size = w.inner_size();
+                x >= self.effective_sidebar_w()
+                    && x <= size.width as f32 / s
+                    && y >= TITLE_HEIGHT
+                    && y <= size.height as f32 / s
+            })
+    }
+
+    pub(crate) fn native_settings_cursor(&self, x: f32, y: f32) -> winit::window::CursorIcon {
+        match self.settings_scene.hit_at(x, y).map(|hit| hit.cursor) {
+            Some(HitCursor::Pointer) => winit::window::CursorIcon::Pointer,
+            Some(HitCursor::Text) => winit::window::CursorIcon::Text,
+            _ => winit::window::CursorIcon::Default,
+        }
+    }
+
+    pub(crate) fn native_settings_click(&mut self, x: f32, y: f32) -> bool {
+        if !self.settings_room_active() {
+            return false;
+        }
+        let hit = self.settings_scene.hit_at(x, y).cloned();
+        let target = hit.as_ref().map(|hit| hit.target.clone());
+        // 어디를 눌러도 펼친 선택 상자는 닫힌다 — 머리를 다시 누른 것만 토글이다.
+        if !matches!(target, Some(Target::Dropdown(_))) {
+            self.settings_scene.close_dropdown();
+        }
+        match target {
+            Some(Target::Dropdown(id)) => {
+                self.native_settings_blur();
+                self.settings_scene.toggle_dropdown(id);
+            }
+            Some(Target::DropdownDismiss) => {}
+            Some(Target::Category(cat)) => {
+                self.native_settings_blur();
+                self.settings_scene.set_category(cat);
+                self.refresh_native_settings_media_cache();
+            }
+            Some(Target::Setting(action)) => {
+                if matches!(action, SettingsAction::PickerSV | SettingsAction::PickerHue) {
+                    if !matches!(
+                        self.settings_input,
+                        Some(SettingsInput::PaletteHex(_) | SettingsInput::DeviceHex(_))
+                    ) {
+                        self.settings_apply(SettingsAction::FocusPaletteHex(0));
+                        self.native_settings_arm_backup(SettingsInput::PaletteHex(0));
+                    }
+                    if let Some(rect) = hit.map(|hit| hit.rect) {
+                        self.settings_scene.mark_field_dirty();
+                        self.picker_preview(&action, rect, (x, y));
+                        self.settings_scene.begin_picker_drag(action, rect);
+                    }
+                    self.chrome_dirty = true;
+                    return true;
+                }
+                self.native_settings_blur();
+                self.native_settings_apply(action);
+                if let Some(field) = self.settings_input {
+                    self.native_settings_arm_backup(field);
+                }
+            }
+            Some(Target::Focus(field)) => {
+                if let SettingsInput::PaletteHex(slot) = field {
+                    if self.settings_input != Some(field) {
+                        self.native_settings_blur();
+                        self.settings_apply(SettingsAction::FocusPaletteHex(slot));
+                        self.native_settings_arm_backup(field);
+                        self.ime_focus = Some(crate::ImeFocus::Settings(field));
+                    }
+                } else if let SettingsInput::DeviceHex(slot) = field {
+                    if self.settings_input != Some(field) {
+                        self.native_settings_blur();
+                        self.settings_apply(SettingsAction::FocusDeviceHex(slot));
+                        self.native_settings_arm_backup(field);
+                        self.ime_focus = Some(crate::ImeFocus::Settings(field));
+                    }
+                } else {
+                    self.native_settings_focus(field);
+                }
+                if let Some(rect) = hit.map(|hit| hit.rect) {
+                    self.native_settings_place_caret(field, rect, (x, y));
+                }
+            }
+            Some(Target::AccountUsage(key)) => {
+                self.native_settings_blur();
+                self.settings_scene.toggle_account_usage(key);
+                self.chrome_dirty = true;
+            }
+            Some(Target::Close) => {
+                self.native_settings_blur();
+                self.return_from_settings_room();
+                return true;
+            }
+            Some(Target::Onboarding(action)) => {
+                self.native_settings_blur();
+                self.native_onboarding_action(action);
+            }
+            None => self.native_settings_blur(),
+        }
+        self.chrome_dirty = true;
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+        true
+    }
+
+    pub(crate) fn native_settings_drag_move(&mut self, x: f32, y: f32) -> bool {
+        let Some((action, rect)) = self.settings_scene.picker_drag() else { return false };
+        self.settings_scene.mark_field_dirty();
+        self.picker_preview(&action, rect, (x, y));
+        self.chrome_dirty = true;
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+        true
+    }
+
+    pub(crate) fn native_settings_end_drag(&mut self) -> bool {
+        let ended = self.settings_scene.end_picker_drag();
+        if ended {
+            match self.settings_input {
+                Some(SettingsInput::PaletteHex(slot)) => self.apply_palette_edit(slot),
+                Some(SettingsInput::DeviceHex(slot)) => self.apply_device_edit(slot),
+                _ => {}
+            }
+        }
+        ended
+    }
+
+    fn native_settings_apply(&mut self, action: SettingsAction) {
+        let refresh = action_refreshes_cache(&action);
+        let accounts = matches!(
+            action,
+            SettingsAction::SwitchAccount(_, _)
+                | SettingsAction::AddClaudeAccount
+                | SettingsAction::AddCodexAccount
+                | SettingsAction::RemoveClaudeAccount(_)
+                | SettingsAction::RemoveCodexAccount(_)
+                | SettingsAction::ReauthAccount(_, _, _)
+        );
+        let media = action_refreshes_media(&action);
+        self.settings_apply(action);
+        if refresh {
+            self.settings_scene.refresh_cache();
+        }
+        if accounts {
+            self.refresh_native_settings_dynamic_cache();
+        }
+        if media {
+            self.reload_native_settings_media_cache();
+        }
+    }
+
+    fn native_settings_focus(&mut self, field: SettingsInput) {
+        if self.settings_input != Some(field) {
+            self.native_settings_blur();
+        }
+        self.native_settings_arm_backup(field);
+        self.settings_scene.clear_field_selection();
+        self.settings_input = Some(field);
+        match field {
+            SettingsInput::CwdPath => self.settings_caret = self.set_cwd_mode.chars().count(),
+            SettingsInput::FileOpenCmd => {
+                self.settings_caret = self.set_file_open_cmd.chars().count()
+            }
+            SettingsInput::Shell => {
+                let detected_preset = self.settings_scene.first_run()
+                    && self
+                        .settings_scene
+                        .onboarding()
+                        .shell_path_is_preset(&self.set_shell);
+                self.set_shell = direct_shell_seed(&self.set_shell, detected_preset);
+                self.settings_caret = self.set_shell.chars().count();
+            }
+            SettingsInput::ClaudeExtra => {
+                self.settings_caret = self.set_claude_extra.chars().count()
+            }
+            SettingsInput::StudentName => self.settings_caret = self.students_name.chars().count(),
+            SettingsInput::StudentPersona => {
+                self.students_caret = self.students_persona.chars().count()
+            }
+            SettingsInput::FeedbackBody => self.feedback_caret = self.feedback_body.chars().count(),
+            SettingsInput::StudentRaw => self.students_raw.caret = self.students_raw.text.chars().count(),
+            SettingsInput::ThemeGenKey => {
+                self.themegen.key_edit.clear();
+                self.settings_caret = 0;
+            }
+            SettingsInput::CustomThemeLabel
+            | SettingsInput::AccountLabel
+            | SettingsInput::MachineField
+            | SettingsInput::LoginCode => {
+                self.settings_caret = self
+                    .native_settings_field_value(field)
+                    .0
+                    .chars()
+                    .count();
+            }
+            SettingsInput::ThemeLabel
+            | SettingsInput::PaletteHex(_)
+            | SettingsInput::DeviceHex(_) => {}
+        }
+        self.ime_focus = Some(crate::ImeFocus::Settings(field));
+        self.preedit.clear();
+        self.in_preedit = false;
+    }
+
+    fn native_settings_place_caret(
+        &mut self,
+        field: SettingsInput,
+        rect: Rect,
+        point: (f32, f32),
+    ) {
+        let multiline_caret = is_multiline(field)
+            .then(|| self.settings_scene.multiline_layout(field).cloned())
+            .flatten()
+            .map(|layout| multiline_caret_from_point(&layout, point));
+        if let Some((buffer, caret)) = field_buffer(self, field) {
+            if is_multiline(field) {
+                if let Some(next) = multiline_caret {
+                    *caret = next.min(buffer.chars().count());
+                }
+            } else {
+                let ratio =
+                    ((point.0 - rect.0 - 10.0) / (rect.2 - 20.0).max(1.0)).clamp(0.0, 1.0);
+                *caret = (buffer.chars().count() as f32 * ratio).round() as usize;
+            }
+        }
+        self.settings_scene.clear_field_selection();
+    }
+
+    fn native_settings_arm_backup(&mut self, field: SettingsInput) {
+        if self.settings_scene.field_backup_matches(field) {
+            return;
+        }
+        let (value, caret) = self.native_settings_field_value(field);
+        self.settings_scene.arm_field_backup(FieldBackup {
+            field,
+            value,
+            caret,
+        });
+    }
+
+    fn native_settings_field_value(&self, field: SettingsInput) -> (String, usize) {
+        match field {
+            SettingsInput::CwdPath => (self.set_cwd_mode.clone(), self.settings_caret),
+            SettingsInput::FileOpenCmd => (self.set_file_open_cmd.clone(), self.settings_caret),
+            SettingsInput::Shell => (self.set_shell.clone(), self.settings_caret),
+            SettingsInput::ClaudeExtra => (self.set_claude_extra.clone(), self.settings_caret),
+            SettingsInput::StudentName => (self.students_name.clone(), self.settings_caret),
+            SettingsInput::StudentPersona => (self.students_persona.clone(), self.students_caret),
+            SettingsInput::FeedbackBody => (self.feedback_body.clone(), self.feedback_caret),
+            SettingsInput::StudentRaw => (self.students_raw.text.clone(), self.students_raw.caret),
+            SettingsInput::ThemeGenKey => (self.themegen.key_edit.clone(), self.settings_caret),
+            SettingsInput::CustomThemeLabel => (
+                self.custom_theme_label_edit
+                    .as_ref()
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default(),
+                self.settings_caret,
+            ),
+            SettingsInput::AccountLabel => (
+                self.account_label_edit
+                    .as_ref()
+                    .map(|(_, _, value)| value.clone())
+                    .unwrap_or_default(),
+                self.settings_caret,
+            ),
+            SettingsInput::MachineField => (
+                self.machine_edit
+                    .as_ref()
+                    .map(|(_, _, value)| value.clone())
+                    .unwrap_or_default(),
+                self.settings_caret,
+            ),
+            SettingsInput::LoginCode => (self.login_code_edit.clone(), self.settings_caret),
+            SettingsInput::ThemeLabel => (
+                self.theme_label_edit
+                    .as_ref()
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default(),
+                self.settings_caret,
+            ),
+            SettingsInput::PaletteHex(_) | SettingsInput::DeviceHex(_) => {
+                (self.set_palette_edit.clone(), self.settings_caret)
+            }
+        }
+    }
+
+    pub(crate) fn native_settings_insert_into(&mut self, field: SettingsInput, text: &str) {
+        let replacing = self.settings_scene.take_field_select_all();
+        if replacing {
+            if let Some((buffer, caret)) = field_buffer(self, field) {
+                buffer.clear();
+                *caret = 0;
+            }
+        }
+        if !text.is_empty() || replacing {
+            self.settings_scene.mark_field_dirty();
+        }
+        match field {
+            SettingsInput::CwdPath => {
+                crate::lineedit::insert(&mut self.set_cwd_mode, &mut self.settings_caret, text)
+            }
+            SettingsInput::FileOpenCmd => {
+                crate::lineedit::insert(&mut self.set_file_open_cmd, &mut self.settings_caret, text)
+            }
+            SettingsInput::Shell => {
+                crate::lineedit::insert(&mut self.set_shell, &mut self.settings_caret, text)
+            }
+            SettingsInput::ClaudeExtra => {
+                crate::lineedit::insert(&mut self.set_claude_extra, &mut self.settings_caret, text)
+            }
+            SettingsInput::StudentName => {
+                crate::lineedit::insert(&mut self.students_name, &mut self.settings_caret, text)
+            }
+            SettingsInput::StudentPersona => {
+                crate::lineedit::insert(&mut self.students_persona, &mut self.students_caret, text)
+            }
+            SettingsInput::FeedbackBody => {
+                crate::lineedit::insert(&mut self.feedback_body, &mut self.feedback_caret, text)
+            }
+            SettingsInput::StudentRaw => {
+                crate::lineedit::insert(&mut self.students_raw.text, &mut self.students_raw.caret, text)
+            }
+            SettingsInput::ThemeGenKey => {
+                crate::lineedit::insert(&mut self.themegen.key_edit, &mut self.settings_caret, text)
+            }
+            SettingsInput::CustomThemeLabel => {
+                if let Some((_, buffer)) = self.custom_theme_label_edit.as_mut() {
+                    crate::lineedit::insert(buffer, &mut self.settings_caret, text);
+                }
+            }
+            SettingsInput::AccountLabel => {
+                if let Some((_, _, buffer)) = self.account_label_edit.as_mut() {
+                    crate::lineedit::insert(buffer, &mut self.settings_caret, text);
+                }
+            }
+            SettingsInput::MachineField => {
+                if let Some((_, _, buffer)) = self.machine_edit.as_mut() {
+                    crate::lineedit::insert(buffer, &mut self.settings_caret, text);
+                }
+            }
+            SettingsInput::LoginCode => {
+                crate::lineedit::insert(&mut self.login_code_edit, &mut self.settings_caret, text);
+            }
+            SettingsInput::ThemeLabel => {
+                if let Some((_, buffer)) = self.theme_label_edit.as_mut() {
+                    crate::lineedit::insert(buffer, &mut self.settings_caret, text);
+                }
+            }
+            SettingsInput::PaletteHex(slot) => {
+                crate::lineedit::insert(&mut self.set_palette_edit, &mut self.settings_caret, text);
+                self.apply_palette_edit(slot);
+            }
+            SettingsInput::DeviceHex(slot) => {
+                crate::lineedit::insert(&mut self.set_palette_edit, &mut self.settings_caret, text);
+                self.apply_device_edit(slot);
+            }
+        }
+        if matches!(
+            field,
+            SettingsInput::CwdPath
+                | SettingsInput::FileOpenCmd
+                | SettingsInput::Shell
+                | SettingsInput::ClaudeExtra
+        ) {
+            self.settings_save();
+        }
+        if field == SettingsInput::FeedbackBody {
+            socket::write_setting(
+                "feedback_draft",
+                serde_json::Value::String(self.feedback_body.clone()),
+            );
+        }
+        self.chrome_dirty = true;
+    }
+
+    pub(crate) fn native_settings_blur(&mut self) {
+        if let Some(field) = self.settings_input {
+            if let Some(text) = self.hangul.flush() {
+                self.native_settings_insert_into(field, &text);
+            }
+        }
+        let (backup, dirty) = self.settings_scene.take_field_backup();
+        if !dirty {
+            if let Some(backup) = backup {
+                self.native_settings_restore_backup(backup);
+            }
+        }
+        if self.settings_input == Some(SettingsInput::StudentPersona) {
+            self.flush_student_persona();
+        }
+        if self.settings_input == Some(SettingsInput::StudentName) {
+            self.flush_student_name();
+            self.settings_scene.refresh_cache();
+        }
+        if self.settings_input == Some(SettingsInput::ThemeLabel) {
+            self.flush_theme_label();
+            self.settings_scene.refresh_cache();
+        }
+        if self.settings_input == Some(SettingsInput::CustomThemeLabel) {
+            self.flush_custom_theme_label();
+            self.settings_scene.refresh_cache();
+        }
+        if self.settings_input == Some(SettingsInput::AccountLabel) {
+            self.flush_account_label();
+            self.refresh_native_settings_dynamic_cache();
+        }
+        if self.settings_input == Some(SettingsInput::MachineField) {
+            self.flush_machine_field();
+        }
+        if self.settings_input == Some(SettingsInput::LoginCode) {
+            self.submit_login_code_field();
+        }
+        if self.settings_input == Some(SettingsInput::ThemeGenKey) {
+            let key = self.themegen.key_edit.trim();
+            if !key.is_empty() {
+                socket::write_setting("gemini_api_key", serde_json::json!(key));
+                self.settings_scene.refresh_cache();
+            }
+            self.themegen.key_edit.clear();
+        }
+        self.settings_input = None;
+        self.settings_scene.clear_field_selection();
+        if matches!(self.ime_focus, Some(crate::ImeFocus::Settings(_))) {
+            self.ime_focus = None;
+        }
+        self.preedit.clear();
+        self.in_preedit = false;
+    }
+
+    fn native_settings_restore_backup(&mut self, backup: FieldBackup) {
+        match backup.field {
+            SettingsInput::CwdPath => self.set_cwd_mode = backup.value,
+            SettingsInput::FileOpenCmd => self.set_file_open_cmd = backup.value,
+            SettingsInput::Shell => self.set_shell = backup.value,
+            SettingsInput::ClaudeExtra => self.set_claude_extra = backup.value,
+            SettingsInput::StudentName => self.students_name = backup.value,
+            SettingsInput::StudentPersona => self.students_persona = backup.value,
+            SettingsInput::FeedbackBody => self.feedback_body = backup.value,
+            SettingsInput::StudentRaw => self.students_raw.text = backup.value,
+            SettingsInput::ThemeGenKey => self.themegen.key_edit = backup.value,
+            SettingsInput::CustomThemeLabel => {
+                if let Some((_, value)) = self.custom_theme_label_edit.as_mut() {
+                    *value = backup.value;
+                }
+            }
+            SettingsInput::AccountLabel => {
+                if let Some((_, _, value)) = self.account_label_edit.as_mut() {
+                    *value = backup.value;
+                }
+            }
+            SettingsInput::MachineField => {
+                if let Some((_, _, value)) = self.machine_edit.as_mut() {
+                    *value = backup.value;
+                }
+            }
+            SettingsInput::LoginCode => self.login_code_edit = backup.value,
+            SettingsInput::ThemeLabel => {
+                if let Some((_, value)) = self.theme_label_edit.as_mut() {
+                    *value = backup.value;
+                }
+            }
+            SettingsInput::PaletteHex(slot) => {
+                self.set_palette_edit = backup.value;
+                self.apply_palette_edit(slot);
+            }
+            SettingsInput::DeviceHex(slot) => {
+                self.set_palette_edit = backup.value;
+                self.apply_device_edit(slot);
+            }
+        }
+        match backup.field {
+            SettingsInput::StudentPersona => self.students_caret = backup.caret,
+            SettingsInput::StudentRaw => self.students_raw.caret = backup.caret,
+            SettingsInput::FeedbackBody => self.feedback_caret = backup.caret,
+            _ => self.settings_caret = backup.caret,
+        }
+        if matches!(
+            backup.field,
+            SettingsInput::CwdPath
+                | SettingsInput::FileOpenCmd
+                | SettingsInput::Shell
+                | SettingsInput::ClaudeExtra
+        ) {
+            self.settings_save();
+        }
+        if backup.field == SettingsInput::FeedbackBody {
+            socket::write_setting(
+                "feedback_draft",
+                serde_json::Value::String(self.feedback_body.clone()),
+            );
+        }
+    }
+
+    fn native_settings_cancel_field(&mut self) {
+        let field = self.settings_input;
+        let _ = self.hangul.flush();
+        let (backup, _) = self.settings_scene.take_field_backup();
+        if let Some(backup) = backup {
+            self.native_settings_restore_backup(backup);
+        }
+        self.settings_input = None;
+        match field {
+            Some(SettingsInput::ThemeLabel) => self.theme_label_edit = None,
+            Some(SettingsInput::CustomThemeLabel) => self.custom_theme_label_edit = None,
+            Some(SettingsInput::AccountLabel) => self.account_label_edit = None,
+            Some(SettingsInput::MachineField) => self.machine_edit = None,
+            // 코드는 지우지 않는다 — 붙여넣다 esc 를 눌러도 다시 치게 하지 않는다.
+            Some(SettingsInput::LoginCode) => {}
+            _ => {}
+        }
+        self.ime_focus = None;
+        self.preedit.clear();
+        self.in_preedit = false;
+        self.chrome_dirty = true;
+    }
+
+    pub(crate) fn native_settings_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::event::ElementState;
+        use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+        if !self.settings_room_active() {
+            return false;
+        }
+        if event.state != ElementState::Pressed {
+            return true;
+        }
+        if self.settings_scene.dropdown().is_some()
+            && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+        {
+            self.settings_scene.close_dropdown();
+            self.chrome_dirty = true;
+            return true;
+        }
+        let Some(field) = self.settings_input else {
+            if self.settings_scene.first_run() {
+                return self.native_onboarding_key(event);
+            }
+            let nav = SettingsCat::nav();
+            let at = nav
+                .iter()
+                .position(|cat| *cat == self.settings_scene.category())
+                .unwrap_or(0);
+            let next = match event.logical_key {
+                Key::Named(NamedKey::ArrowUp) => at.saturating_sub(1),
+                Key::Named(NamedKey::ArrowDown) => (at + 1).min(nav.len() - 1),
+                _ => return false,
+            };
+            self.settings_scene.set_category(nav[next]);
+            self.chrome_dirty = true;
+            return true;
+        };
+
+        self.ime_retarget(crate::ImeFocus::Settings(field));
+        let host = self.host_mod();
+        if host && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyA)) {
+            self.settings_scene.select_all_field();
+            if let Some((buffer, caret)) = field_buffer(self, field) {
+                *caret = buffer.chars().count();
+            }
+            self.chrome_dirty = true;
+            return true;
+        }
+        if host && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyC)) {
+            if self.settings_scene.field_select_all() {
+                let value = self.native_settings_field_value(field).0;
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(value);
+                }
+            }
+            return true;
+        }
+        if host && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyX)) {
+            if self.settings_scene.field_select_all() {
+                let value = self.native_settings_field_value(field).0;
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(value);
+                }
+                self.native_settings_insert_into(field, "");
+            }
+            return true;
+        }
+        if host && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyZ)) {
+            if let Some(backup) = self.settings_scene.field_backup() {
+                self.native_settings_restore_backup(backup.clone());
+                self.settings_scene.arm_field_backup(backup);
+                self.settings_scene.select_all_field();
+                self.chrome_dirty = true;
+            }
+            return true;
+        }
+        if host && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyV)) {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(mut text) = clipboard.get_text() {
+                    if !is_multiline(field) {
+                        text = text.replace(['\n', '\r'], " ");
+                    }
+                    self.native_settings_insert_into(field, &text);
+                }
+            }
+            return true;
+        }
+        if host {
+            return true;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let one = |text: &str| {
+                let mut chars = text.chars();
+                chars.next().filter(|_| chars.next().is_none())
+            };
+            let typed = event.text.as_ref().and_then(|text| one(text)).or_else(|| {
+                if let Key::Character(text) = &event.logical_key {
+                    one(text)
+                } else {
+                    None
+                }
+            });
+            if let Some(ch) = typed.filter(|ch| is_jamo(*ch)) {
+                if let Some(text) = self.hangul.feed(ch) {
+                    self.native_settings_insert_into(field, &text);
+                }
+                self.preedit = self.hangul.preedit().unwrap_or_default();
+                self.in_preedit = !self.preedit.is_empty();
+                self.chrome_dirty = true;
+                return true;
+            }
+            if matches!(event.logical_key, Key::Named(NamedKey::Backspace))
+                && self.hangul.backspace()
+            {
+                self.preedit = self.hangul.preedit().unwrap_or_default();
+                self.in_preedit = !self.preedit.is_empty();
+                self.chrome_dirty = true;
+                return true;
+            }
+            if let Some(text) = self.hangul.flush() {
+                self.native_settings_insert_into(field, &text);
+            }
+            self.preedit.clear();
+            self.in_preedit = false;
+        }
+
+        if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+            self.native_settings_cancel_field();
+            return true;
+        }
+
+        if self.settings_scene.field_select_all()
+            && matches!(
+                event.logical_key,
+                Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete)
+            )
+        {
+            self.native_settings_insert_into(field, "");
+            return true;
+        }
+        if self.settings_scene.field_select_all()
+            && matches!(
+                event.logical_key,
+                Key::Named(NamedKey::ArrowLeft)
+                    | Key::Named(NamedKey::ArrowRight)
+                    | Key::Named(NamedKey::Home)
+                    | Key::Named(NamedKey::End)
+            )
+        {
+            self.settings_scene.clear_field_selection();
+        }
+
+        if is_multiline(field)
+            && matches!(
+                event.logical_key,
+                Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowDown)
+            )
+        {
+            let current = self.native_settings_field_value(field).1;
+            let down = matches!(event.logical_key, Key::Named(NamedKey::ArrowDown));
+            let next = self
+                .settings_scene
+                .multiline_layout(field)
+                .map(|layout| move_multiline_caret(layout, current, down));
+            if let (Some(next), Some((buffer, caret))) = (next, field_buffer(self, field)) {
+                *caret = next.min(buffer.chars().count());
+            }
+            self.chrome_dirty = true;
+            return true;
+        }
+
+        match event.logical_key {
+            Key::Named(NamedKey::Enter) if is_multiline(field) => {
+                self.native_settings_insert_into(field, "\n");
+                return true;
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.native_settings_blur();
+                self.set_toast("저장됐어요".to_string());
+                return true;
+            }
+            Key::Named(NamedKey::Backspace)
+            | Key::Named(NamedKey::Delete)
+            | Key::Named(NamedKey::ArrowLeft)
+            | Key::Named(NamedKey::ArrowRight)
+            | Key::Named(NamedKey::Home)
+            | Key::Named(NamedKey::End) => {}
+            Key::Named(NamedKey::Space) => {
+                self.native_settings_insert_into(field, " ");
+                return true;
+            }
+            Key::Character(ref text) => {
+                if !(self.ime_active || self.in_preedit) || !text.chars().any(is_hangul_codepoint) {
+                    self.native_settings_insert_into(field, text);
+                }
+                return true;
+            }
+            _ => return true,
+        }
+        let changed = field_buffer(self, field).is_some_and(|(buffer, caret)| {
+            crate::lineedit::key(buffer, caret, &event.logical_key)
+                == crate::lineedit::LineEditAction::Edited
+        });
+        if changed {
+            self.settings_scene.mark_field_dirty();
+            if matches!(
+                field,
+                SettingsInput::CwdPath
+                    | SettingsInput::FileOpenCmd
+                    | SettingsInput::Shell
+                    | SettingsInput::ClaudeExtra
+            ) {
+                self.settings_save();
+            }
+            match field {
+                SettingsInput::PaletteHex(slot) => self.apply_palette_edit(slot),
+                SettingsInput::DeviceHex(slot) => self.apply_device_edit(slot),
+                _ => {}
+            }
+        }
+        self.chrome_dirty = true;
+        true
+    }
+
+    pub(crate) fn native_settings_ime(&mut self, ime: winit::event::Ime) {
+        if !self.settings_room_active() {
+            return;
+        }
+        match ime {
+            winit::event::Ime::Enabled => self.ime_active = true,
+            winit::event::Ime::Disabled => {
+                self.ime_active = false;
+                self.in_preedit = false;
+                self.preedit.clear();
+            }
+            winit::event::Ime::Preedit(text, _) => {
+                if let Some(field) = self.settings_input {
+                    self.ime_focus = Some(crate::ImeFocus::Settings(field));
+                    self.ime_active = true;
+                    self.in_preedit = !text.is_empty();
+                    self.preedit = text;
+                }
+            }
+            winit::event::Ime::Commit(text) => {
+                if let Some(field) = self.settings_input {
+                    self.native_settings_insert_into(field, &text);
+                }
+                self.in_preedit = false;
+                self.preedit.clear();
+            }
+        }
+        self.chrome_dirty = true;
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    pub(crate) fn native_settings_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
+        let dy = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, y) => y * 42.0,
+            winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32,
+        };
+        let scrolled = if self.settings_scene.dropdown().is_some() {
+            self.settings_scene.dropdown_scroll_by(-dy)
+        } else {
+            self.settings_scene.scroll_by(-dy)
+        };
+        if scrolled {
+            self.chrome_dirty = true;
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
+    pub(crate) fn native_settings_drop(&mut self, path: std::path::PathBuf) -> bool {
+        if !self.settings_room_active() {
+            return false;
+        }
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
+            match socket::import_theme(&path) {
+                Ok(id) => self.set_toast(format!("'{id}' 을 가져왔어요 — 테마에서 고르면 켜져요")),
+                Err(error) => self.set_toast(format!("테마를 못 가져왔어요 — {error}")),
+            }
+            socket::invalidate_theme_rows();
+            kasa_mcp::character::invalidate_active_theme();
+            theme::invalidate_roster();
+            self.settings_scene.refresh_cache();
+            self.reload_native_settings_media_cache();
+            return true;
+        }
+        if self.settings_scene.category() != SettingsCat::Students {
+            self.set_toast("테마 압축 파일은 어느 설정 화면에서든 놓을 수 있어요".to_string());
+            return true;
+        }
+        if let (Some(name), Some((motion, frame))) = (
+            self.students_selected.clone(),
+            self.settings_scene
+                .sprite_slot()
+                .map(|(motion, frame)| (motion.to_string(), frame)),
+        ) {
+            let slug = if self.students_slug.is_empty() {
+                theme::agent_slug(&name)
+            } else {
+                self.students_slug.clone()
+            };
+            let Some((count, ext)) = socket::character_sprite_spec(&motion) else {
+                self.set_toast("그 모션 칸을 못 찾았어요".to_string());
+                return true;
+            };
+            if let Err(error) = drop_size_ok(&path, SPRITE_DROP_MAX_BYTES) {
+                self.set_toast(error);
+                return true;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.set_toast(format!("그림을 못 읽었어요 — {error}"));
+                    return true;
+                }
+            };
+            let mut frames = Vec::with_capacity(count);
+            for index in 0..count {
+                if index == frame {
+                    frames.push(bytes.clone());
+                } else if let Some(existing) = socket::character_sprite_bytes_in_theme(
+                    &self.students_theme,
+                    &slug,
+                    &motion,
+                    index,
+                ) {
+                    frames.push(existing);
+                } else {
+                    self.set_toast(format!(
+                        "{motion}은 {count}장의 {ext}가 모두 있어야 해요 — 없는 칸부터 채워 주세요"
+                    ));
+                    return true;
+                }
+            }
+            match socket::save_character_sprite_files_in_theme(
+                &self.students_theme,
+                &slug,
+                &motion,
+                &frames,
+            ) {
+                Ok(_) => {
+                    self.settings_apply(SettingsAction::RefreshStudentAssets);
+                    self.reload_native_settings_media_cache();
+                    self.set_toast(format!("{motion} {}번째 그림을 바꿨어요", frame + 1));
+                }
+                Err(error) => self.set_toast(format!("그림을 못 바꿨어요 — {error}")),
+            }
+            return true;
+        }
+        let theme_id = if self.students_selected.is_some() {
+            self.students_theme.clone()
+        } else {
+            self.settings_scene.cache().character_theme.clone()
+        };
+        if theme_id.is_empty() {
+            self.set_toast("기본 테마에는 못 구워요 — 테마를 복제한 뒤 놓아 주세요".to_string());
+            return true;
+        }
+        if self.students_selected.is_none() {
+            if let Err(error) = drop_size_ok(&path, THEMEGEN_DROP_MAX_BYTES) {
+                self.set_toast(error);
+                return true;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.set_toast(format!("그림을 못 읽었어요 — {error}"));
+                    return true;
+                }
+            };
+            let name = path.file_name().and_then(|value| value.to_str());
+            match crate::themegen::themegen_put_ref(None, name, &bytes) {
+                Ok(slug) => {
+                    socket::invalidate_theme_rows();
+                    kasa_mcp::character::invalidate_active_theme();
+                    theme::invalidate_roster();
+                    self.settings_scene.refresh_cache();
+                    if let Some(name) = self
+                        .settings_scene
+                        .cache()
+                        .characters
+                        .iter()
+                        .find(|character| character.slug == slug)
+                        .map(|character| character.name.clone())
+                    {
+                        self.select_student_for_edit(name);
+                    }
+                    self.set_toast(format!("{slug} 캐릭터와 참조 그림을 만들었어요"));
+                }
+                Err(error) => self.set_toast(format!("캐릭터를 못 만들었어요 — {error}")),
+            }
+            return true;
+        }
+        let slug = self.students_slug.clone();
+        if slug.is_empty() {
+            self.set_toast("캐릭터의 그림 이름을 못 찾았어요".to_string());
+            return true;
+        }
+        let Some(root) = kasa_mcp::character::themes_root() else {
+            return true;
+        };
+        if let Err(error) = drop_size_ok(&path, THEMEGEN_DROP_MAX_BYTES) {
+            self.set_toast(error);
+            return true;
+        }
+        match crate::themegen::place_themegen_ref(&root.join(theme_id), &slug, &path) {
+            Ok(_) => {
+                self.settings_scene.refresh_cache();
+                self.reload_native_settings_media_cache();
+                self.set_toast("참조 그림을 놓았어요".to_string());
+            }
+            Err(error) => self.set_toast(format!("그림을 못 놓았어요 — {error}")),
+        }
+        true
+    }
+}
+
+fn motion_preview_pump_needed(room_active: bool, detail_open: bool, visible_this_frame: bool) -> bool {
+    room_active && detail_open && visible_this_frame
+}
+
+fn drop_size_ok(path: &std::path::Path, limit: u64) -> Result<u64, String> {
+    let metadata = std::fs::metadata(path).map_err(|error| format!("파일 크기를 못 읽었어요 — {error}"))?;
+    if !metadata.is_file() {
+        return Err("파일 하나를 놓아 주세요".to_string());
+    }
+    if metadata.len() > limit {
+        return Err(format!("그림이 너무 커요 — 최대 {}MB", limit >> 20));
+    }
+    Ok(metadata.len())
+}
+
+fn is_multiline(field: SettingsInput) -> bool {
+    matches!(
+        field,
+        SettingsInput::StudentPersona | SettingsInput::StudentRaw | SettingsInput::FeedbackBody
+    )
+}
+
+fn action_refreshes_cache(action: &SettingsAction) -> bool {
+    matches!(
+        action,
+        SettingsAction::UiLanguage(_)
+            | SettingsAction::ThemeMode(_)
+            | SettingsAction::ThemeSystemSlot(_, _)
+            | SettingsAction::StartCustomTheme
+            | SettingsAction::ResetCustomTheme
+            | SettingsAction::DeleteCustomTheme(_)
+            | SettingsAction::SelectTheme(_)
+            | SettingsAction::ExportTheme
+            | SettingsAction::DeleteTheme(_)
+            | SettingsAction::RefreshStudentAssets
+            | SettingsAction::StudentModel(_, _)
+            | SettingsAction::ThemePickAll(_, _)
+            | SettingsAction::CharacterPick(_, _, _)
+            | SettingsAction::ThemeGenProvider(_)
+    )
+}
+
+fn action_refreshes_media(action: &SettingsAction) -> bool {
+    matches!(
+        action,
+        SettingsAction::ExportTheme
+            | SettingsAction::DeleteTheme(_)
+            | SettingsAction::InspectTheme(_)
+            | SettingsAction::RefreshStudentAssets
+            | SettingsAction::ResetMotion(_)
+    )
+}
+
+pub(crate) fn remote_action_refreshes_media(action: &str) -> bool {
+    matches!(action, "new-theme" | "delete-theme" | "refresh-assets")
+}
+
+fn direct_shell_seed(current: &str, detected_preset: bool) -> String {
+    if detected_preset || matches!(current, "" | "/bin/zsh" | "/bin/bash") {
+        String::new()
+    } else {
+        current.to_string()
+    }
+}
+
+fn multiline_first_line(caret_line: usize, visible_lines: usize, focused: bool) -> usize {
+    if focused {
+        caret_line.saturating_sub(visible_lines.saturating_sub(1))
+    } else {
+        0
+    }
+}
+
+fn visual_row_at(rows: &[VisualRow], caret: usize) -> usize {
+    rows.iter()
+        .position(|row| caret >= row.start && caret <= row.start + row.len)
+        .unwrap_or_else(|| rows.len().saturating_sub(1))
+}
+
+fn nearest_caret_boundary(xs: &[f32], x: f32) -> usize {
+    xs.iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (*a - x)
+                .abs()
+                .partial_cmp(&(*b - x).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or(0, |(index, _)| index)
+}
+
+fn multiline_caret_from_point(layout: &MultilineLayout, point: (f32, f32)) -> usize {
+    if layout.rows.is_empty() {
+        return 0;
+    }
+    let visible_row = ((point.1 - layout.rect.1 - 10.0) / 18.0)
+        .floor()
+        .max(0.0) as usize;
+    let row_index = (layout.first_line + visible_row.min(layout.visible_lines.saturating_sub(1)))
+        .min(layout.rows.len() - 1);
+    let row = &layout.rows[row_index];
+    let x = (point.0 - layout.rect.0 - 11.0).max(0.0);
+    row.start + nearest_caret_boundary(&row.caret_xs, x).min(row.len)
+}
+
+fn move_multiline_caret(layout: &MultilineLayout, caret: usize, down: bool) -> usize {
+    if layout.rows.is_empty() {
+        return caret;
+    }
+    let row = visual_row_at(&layout.rows, caret);
+    let local = caret.saturating_sub(layout.rows[row].start).min(layout.rows[row].len);
+    let x = layout.rows[row].caret_xs.get(local).copied().unwrap_or_default();
+    let target = if down {
+        (row + 1).min(layout.rows.len().saturating_sub(1))
+    } else {
+        row.saturating_sub(1)
+    };
+    layout.rows[target].start
+        + nearest_caret_boundary(&layout.rows[target].caret_xs, x).min(layout.rows[target].len)
+}
+
+fn is_jamo(ch: char) -> bool {
+    (0x3130..=0x318f).contains(&(ch as u32))
+}
+
+fn field_buffer(app: &mut App, field: SettingsInput) -> Option<(&mut String, &mut usize)> {
+    match field {
+        SettingsInput::CwdPath => Some((&mut app.set_cwd_mode, &mut app.settings_caret)),
+        SettingsInput::FileOpenCmd => Some((&mut app.set_file_open_cmd, &mut app.settings_caret)),
+        SettingsInput::Shell => Some((&mut app.set_shell, &mut app.settings_caret)),
+        SettingsInput::ClaudeExtra => Some((&mut app.set_claude_extra, &mut app.settings_caret)),
+        SettingsInput::StudentName => Some((&mut app.students_name, &mut app.settings_caret)),
+        SettingsInput::StudentPersona => Some((&mut app.students_persona, &mut app.students_caret)),
+        SettingsInput::FeedbackBody => Some((&mut app.feedback_body, &mut app.feedback_caret)),
+        SettingsInput::StudentRaw => Some((&mut app.students_raw.text, &mut app.students_raw.caret)),
+        SettingsInput::ThemeGenKey => Some((&mut app.themegen.key_edit, &mut app.settings_caret)),
+        SettingsInput::LoginCode => Some((&mut app.login_code_edit, &mut app.settings_caret)),
+        SettingsInput::CustomThemeLabel => app
+            .custom_theme_label_edit
+            .as_mut()
+            .map(|(_, buffer)| (buffer, &mut app.settings_caret)),
+        SettingsInput::AccountLabel => app
+            .account_label_edit
+            .as_mut()
+            .map(|(_, _, buffer)| (buffer, &mut app.settings_caret)),
+        SettingsInput::MachineField => app
+            .machine_edit
+            .as_mut()
+            .map(|(_, _, buffer)| (buffer, &mut app.settings_caret)),
+        SettingsInput::ThemeLabel => app
+            .theme_label_edit
+            .as_mut()
+            .map(|(_, buffer)| (buffer, &mut app.settings_caret)),
+        SettingsInput::PaletteHex(_) | SettingsInput::DeviceHex(_) => {
+            Some((&mut app.set_palette_edit, &mut app.settings_caret))
+        }
+    }
+}
+
+pub(crate) fn paint(g: &mut gpu::GpuRenderer, snapshot: &Snapshot) -> PaintOutput {
+    crate::native_strings::set_language(&snapshot.language);
+    if snapshot.first_run {
+        return crate::native_onboarding::paint(g, &snapshot.onboarding);
+    }
+    begin_paint_feedback();
+    let (ax, ay, aw, ah) = snapshot.area;
+    let nav_w = if aw < 760.0 { 154.0 } else { 200.0 };
+    let mut hits = Vec::new();
+    let mut caret_rect = None;
+
+    g.rect(ax, ay, aw, ah, theme::bg());
+    // 목업(플랫): 옆 목록은 구분선 없이 배경만 다르고, 머리글은 작은 흐림 글자.
+    g.rect(ax, ay, nav_w, ah, theme::panel_bg());
+    draw_text(g, ax + 20.0, ay + 24.0, "설정", 13.0, theme::text_dim(), false);
+
+    let mut ny = ay + 56.0;
+    for &cat in SettingsCat::nav() {
+        let (label, icon, _) = category_meta(cat);
+        let rect = (ax + 12.0, ny, nav_w - 24.0, 32.0);
+        // 테마 페이지는 「캐릭터」 밑으로 들어갔다 — 거기 있는 동안도 캐릭터 칸이 켜진다.
+        let selected = cat == snapshot.cat
+            || (cat == SettingsCat::Students && snapshot.cat == SettingsCat::Theme);
+        let hover = contains(rect, snapshot.cursor);
+        if selected || hover {
+            round_rect(
+                g,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                ctrl_radius(),
+                if selected {
+                    theme::surface_active()
+                } else {
+                    theme::surface_hover()
+                },
+            );
+        }
+        g.queue_icon(
+            icon,
+            rect.0 + 10.0,
+            rect.1 + 9.0,
+            14.0,
+            if selected {
+                theme::text()
+            } else {
+                theme::text_mute()
+            },
+        );
+        draw_text(
+            g,
+            rect.0 + 32.0,
+            rect.1 + 9.0,
+            label,
+            12.0,
+            if selected {
+                theme::text()
+            } else {
+                theme::text_dim()
+            },
+            selected,
+        );
+        register(&mut hits, Target::Category(cat), rect, HitCursor::Pointer);
+        g.hover_pointer |= hover;
+        ny += 36.0;
+    }
+
+    let close = (ax + 12.0, ay + ah - 46.0, nav_w - 24.0, 32.0);
+    let close_hover = contains(close, snapshot.cursor);
+    if close_hover {
+        round_rect(
+            g,
+            close.0,
+            close.1,
+            close.2,
+            close.3,
+            ctrl_radius(),
+            theme::surface_hover(),
+        );
+    }
+    g.queue_icon(
+        "chevron-left",
+        close.0 + 10.0,
+        close.1 + 9.0,
+        15.0,
+        theme::text_dim(),
+    );
+    draw_text(
+        g,
+        close.0 + 33.0,
+        close.1 + 9.0,
+        "작업 방으로",
+        12.0,
+        theme::text_dim(),
+        false,
+    );
+    register(&mut hits, Target::Close, close, HitCursor::Pointer);
+
+    let (content_x, content_w) = content_column(ax, aw, nav_w);
+    let (title, _, _blurb) = category_meta(snapshot.cat);
+    draw_text(g, content_x, ay + 26.0, title, 20.0, theme::text(), true);
+
+    let body_top = ay + HEADER_H + 14.0;
+    let body_bottom = ay + ah - 12.0;
+    let view_h = (body_bottom - body_top).max(0.0);
+    g.push_clip(content_x, body_top, content_w, view_h);
+    let mut y = body_top - snapshot.scroll;
+
+    match snapshot.cat {
+        SettingsCat::General => paint_general(
+            g,
+            snapshot,
+            &mut hits,
+            &mut caret_rect,
+            content_x,
+            &mut y,
+            content_w,
+        ),
+        SettingsCat::Appearance => {
+            paint_appearance(
+                g,
+                snapshot,
+                &mut hits,
+                &mut caret_rect,
+                content_x,
+                &mut y,
+                content_w,
+            )
+        }
+        SettingsCat::Statusbar => paint_statusbar(
+            g,
+            snapshot,
+            &mut hits,
+            content_x,
+            &mut y,
+            content_w,
+        ),
+        SettingsCat::Shell => paint_shell(
+            g,
+            snapshot,
+            &mut hits,
+            &mut caret_rect,
+            content_x,
+            &mut y,
+            content_w,
+        ),
+        SettingsCat::Claude => paint_claude(
+            g,
+            snapshot,
+            &mut hits,
+            &mut caret_rect,
+            content_x,
+            &mut y,
+            content_w,
+        ),
+        SettingsCat::Accounts => paint_accounts(
+            g,
+            snapshot,
+            &mut hits,
+            &mut caret_rect,
+            content_x,
+            &mut y,
+            content_w,
+        ),
+        SettingsCat::Machines => paint_machines(
+            g,
+            snapshot,
+            &mut hits,
+            &mut caret_rect,
+            content_x,
+            &mut y,
+            content_w,
+        ),
+        SettingsCat::Theme => paint_themes(
+            g,
+            snapshot,
+            &mut hits,
+            &mut caret_rect,
+            content_x,
+            &mut y,
+            content_w,
+        ),
+        SettingsCat::Students => paint_students(
+            g,
+            snapshot,
+            &mut hits,
+            &mut caret_rect,
+            content_x,
+            &mut y,
+            content_w,
+        ),
+        SettingsCat::Pet => paint_pet(g, snapshot, &mut hits, content_x, &mut y, content_w),
+        SettingsCat::Feedback => paint_feedback(
+            g,
+            snapshot,
+            &mut hits,
+            &mut caret_rect,
+            content_x,
+            &mut y,
+            content_w,
+        ),
+    }
+    g.pop_clip();
+    let content_h = (y + snapshot.scroll - body_top + 18.0).max(view_h);
+    // 스크롤바는 **스크롤되는 영역**의 오른쪽에 붙어야 한다. 글자가 앉는
+    // `content_*` 를 그대로 주면 그 좌우 여백만큼 안으로 들어와, 막대가 패널
+    // 가장자리에서 58px 떨어진 허공에 뜬다(2026-09-05 지적 「스크롤바가 왜 저기
+    // 있어 영역설정이 잘못된듯」 · 실측 패널끝 1100 · 막대 1042). 뷰포트는 좌측
+    // nav 오른쪽부터 패널 끝까지다.
+    let scroll_x = ax + nav_w;
+    let scroll_w = (ax + aw - scroll_x).max(0.0);
+    paint_scroll_affordance(
+        g,
+        scroll_x,
+        body_top,
+        scroll_w,
+        view_h,
+        content_h,
+        snapshot.scroll,
+    );
+
+    let feedback = take_paint_feedback();
+    let mut dropdown_scroll_max = 0.0;
+    if let (Some(open), Some((id, anchor))) = (snapshot.dropdown, feedback.dropdown_anchor) {
+        if open == id {
+            dropdown_scroll_max = paint_dropdown_popup(g, snapshot, &mut hits, id, anchor);
+        }
+    }
+    PaintOutput {
+        hits,
+        dropdown_scroll_max,
+        content_h,
+        view_h,
+        caret_rect,
+        multiline_layouts: feedback.multiline_layouts,
+        motion_preview_visible: feedback.motion_preview_visible,
+    }
+}
+
+pub(crate) fn paint_scroll_affordance(
+    g: &mut gpu::GpuRenderer,
+    x: f32,
+    y: f32,
+    w: f32,
+    view_h: f32,
+    content_h: f32,
+    scroll: f32,
+) {
+    let max_scroll = (content_h - view_h).max(0.0);
+    if max_scroll <= 1.0 || view_h <= 1.0 {
+        return;
+    }
+    let track_x = x + w - 6.0;
+    g.rect(
+        track_x,
+        y,
+        4.0,
+        view_h,
+        theme::with_alpha(theme::border(), 90),
+    );
+    let thumb_h = (view_h * view_h / content_h).clamp(28.0, view_h);
+    let thumb_y = y + (view_h - thumb_h) * (scroll / max_scroll).clamp(0.0, 1.0);
+    round_rect(
+        g,
+        track_x,
+        thumb_y,
+        4.0,
+        thumb_h,
+        2.0,
+        theme::text_dim(),
+    );
+    if scroll < max_scroll - 1.0 {
+        g.rect(
+            x,
+            y + view_h - 22.0,
+            w,
+            22.0,
+            theme::with_alpha(theme::bg(), 210),
+        );
+        g.queue_icon(
+            "chevron-down",
+            x + w - 20.0,
+            y + view_h - 19.0,
+            13.0,
+            theme::text_dim(),
+        );
+    }
+}
+
+fn paint_general(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    *y += 6.0;
+    seg_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "언어",
+        &[
+            ("한국어", s.language == "ko", SettingsAction::UiLanguage("ko")),
+            ("English", s.language == "en", SettingsAction::UiLanguage("en")),
+        ],
+    );
+    *y += 8.0;
+    section_title(
+        g,
+        x,
+        *y,
+        "시작과 파일",
+        "새 작업 방과 파일을 여는 기본 동작입니다",
+    );
+    *y += 54.0;
+    seg_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "새 방의 시작 폴더",
+        &[
+            (
+                "마지막 위치",
+                s.cwd_mode == "last",
+                SettingsAction::CwdMode("last"),
+            ),
+            ("홈", s.cwd_mode == "home", SettingsAction::CwdMode("home")),
+            (
+                "직접 지정",
+                s.cwd_mode != "last" && s.cwd_mode != "home",
+                SettingsAction::CwdMode("custom"),
+            ),
+        ],
+    );
+    if s.cwd_mode != "last" && s.cwd_mode != "home" {
+        text_field(
+            g,
+            s,
+            hits,
+            caret,
+            x,
+            *y,
+            w,
+            "시작 폴더",
+            &s.cwd_mode,
+            SettingsInput::CwdPath,
+            s.settings_caret,
+            false,
+        );
+        *y += ROW_H;
+    }
+    seg_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "파일을 여는 곳",
+        &[
+            (
+                "카사텀",
+                s.file_open_mode == "builtin",
+                SettingsAction::FileOpenMode("builtin"),
+            ),
+            (
+                "앱",
+                matches!(s.file_open_mode.as_str(), "app" | "system"),
+                SettingsAction::FileOpenMode("app"),
+            ),
+            (
+                "터미널",
+                s.file_open_mode == "terminal",
+                SettingsAction::FileOpenMode("terminal"),
+            ),
+        ],
+    );
+    if matches!(s.file_open_mode.as_str(), "app" | "system") {
+        let mut choices: Vec<(String, bool, SettingsAction)> = s
+            .open_apps
+            .iter()
+            .map(|(name, short)| {
+                (
+                    short.clone(),
+                    s.file_open_app == *name,
+                    SettingsAction::FileOpenApp(name.clone()),
+                )
+            })
+            .collect();
+        choices.push((
+            "기본 앱".to_string(),
+            s.file_open_app.is_empty(),
+            SettingsAction::FileOpenApp(String::new()),
+        ));
+        chips_owned(g, s, hits, x, y, w, choices);
+    }
+    if s.file_open_mode == "terminal" {
+        text_field(
+            g,
+            s,
+            hits,
+            caret,
+            x,
+            *y,
+            w,
+            "편집기 명령",
+            &s.file_open_cmd,
+            SettingsInput::FileOpenCmd,
+            s.settings_caret,
+            false,
+        );
+        *y += ROW_H;
+    }
+    toggle_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "파일 트리 기본으로 열기",
+        s.file_tree_default,
+        SettingsAction::ToggleFileTree,
+    );
+    toggle_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "pane 하단바 기본으로 켜기",
+        s.footer_default,
+        SettingsAction::ToggleFooter,
+    );
+
+    *y += 12.0;
+    section_title(
+        g,
+        x,
+        *y,
+        "편집과 스크롤",
+        "자주 바꾸지 않는 입력 감각만 모았습니다",
+    );
+    *y += 54.0;
+    let autosave = [("끔", 0), ("1초", 1000), ("3초", 3000), ("10초", 10000)];
+    let autosave_cells: Vec<(&str, bool, SettingsAction)> = autosave
+        .iter()
+        .map(|(label, ms)| {
+            (
+                *label,
+                s.autosave_ms == *ms,
+                SettingsAction::AutosaveDelay(*ms),
+            )
+        })
+        .collect();
+    seg_row(g, s, hits, x, y, w, "편집기 자동 저장", &autosave_cells);
+    let gain = (s.wheel_gain * 100.0).round() as u32;
+    seg_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "휠 스크롤 속도",
+        &[
+            ("차분하게", gain == 30, SettingsAction::WheelPixelGain(30)),
+            ("보통", gain == 60, SettingsAction::WheelPixelGain(60)),
+            ("빠르게", gain == 100, SettingsAction::WheelPixelGain(100)),
+            (
+                "아주 빠르게",
+                gain == 150,
+                SettingsAction::WheelPixelGain(150),
+            ),
+        ],
+    );
+    stepper_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "창 상태줄 높이",
+        &format!("{:.0}px", s.status_h),
+        SettingsAction::StatusBarH((s.status_h - 2.0).max(socket::STATUS_H_MIN) as u32),
+        SettingsAction::StatusBarH((s.status_h + 2.0).min(socket::STATUS_H_MAX) as u32),
+    );
+    stepper_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "pane 하단바 높이",
+        &format!("{:.0}px", s.footer_h),
+        SettingsAction::PaneFooterH((s.footer_h - 2.0).max(socket::PANE_FOOTER_H_MIN) as u32),
+        SettingsAction::PaneFooterH((s.footer_h + 2.0).min(socket::PANE_FOOTER_H_MAX) as u32),
+    );
+}
+
+fn paint_appearance(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "색과 형태",
+        "현재 테마 토큰을 모든 네이티브 화면이 함께 씁니다",
+    );
+    *y += 54.0;
+    let gap = 10.0;
+    let grid_cols = if w >= 600.0 { 3 } else { 2 };
+    let pw = (w - gap * (grid_cols - 1) as f32) / grid_cols as f32;
+    let ph = 92.0;
+    for (i, palette) in s.palettes.iter().enumerate() {
+        let rect = (
+            x + (i % grid_cols) as f32 * (pw + gap),
+            *y + (i / grid_cols) as f32 * (ph + gap),
+            pw,
+            ph,
+        );
+        choice_card(
+            g,
+            s,
+            hits,
+            rect,
+            s.theme == palette.key,
+            Target::Setting(SettingsAction::ThemeMode(palette.key.clone())),
+        );
+        round_rect(
+            g,
+            rect.0 + 10.0,
+            rect.1 + 10.0,
+            rect.2 - 20.0,
+            42.0,
+            theme::radius_sm(),
+            palette.bg,
+        );
+        draw_text(
+            g,
+            rect.0 + 18.0,
+            rect.1 + 23.0,
+            "가 Aa",
+            13.0,
+            palette.text,
+            true,
+        );
+        for (j, color) in palette.ansi.iter().enumerate() {
+            g.rect(
+                rect.0 + 12.0 + j as f32 * 13.0,
+                rect.1 + 60.0,
+                9.0,
+                9.0,
+                [color[0], color[1], color[2], 255],
+            );
+        }
+        let label = fit(g, &palette.label, rect.2 - 105.0, 11.0, false);
+        draw_text(
+            g,
+            rect.0 + 94.0,
+            rect.1 + 59.0,
+            &label,
+            11.0,
+            theme::text_dim(),
+            false,
+        );
+    }
+    let palette_rows = (s.palettes.len() + grid_cols - 1) / grid_cols;
+    *y += palette_rows as f32 * (ph + gap) + 4.0;
+    if s.theme == "system" {
+        section_title(
+            g,
+            x,
+            *y,
+            "시스템 밝기별 테마",
+            "운영체제가 밝음/어두움을 바꿀 때 입을 팔레트입니다",
+        );
+        *y += 52.0;
+        for (light, label, current) in [
+            (true, "밝은 화면", s.system_light.as_str()),
+            (false, "어두운 화면", s.system_dark.as_str()),
+        ] {
+            draw_text(g, x + 2.0, *y + 9.0, label, 11.5, theme::text_dim(), false);
+            let choices = s
+                .palettes
+                .iter()
+                .filter(|palette| palette.key != "system")
+                .map(|palette| {
+                    (
+                        palette.label.clone(),
+                        palette.key == current,
+                        SettingsAction::ThemeSystemSlot(light, palette.key.clone()),
+                    )
+                })
+                .collect();
+            *y += 28.0;
+            chips_owned(g, s, hits, x, y, w, choices);
+        }
+        *y += 8.0;
+    }
+    button(
+        g,
+        s,
+        hits,
+        (x, *y, 150.0, 34.0),
+        "현재 색으로 복제",
+        Target::Setting(SettingsAction::StartCustomTheme),
+        false,
+    );
+    *y += 48.0;
+    if !s.custom_active.is_empty() {
+        let label = s
+            .custom_themes
+            .iter()
+            .find(|custom| custom.slug == s.custom_active)
+            .map(|custom| custom.label.as_str())
+            .unwrap_or(s.custom_active.as_str());
+        let edit_value = s
+            .custom_theme_label_edit
+            .as_ref()
+            .filter(|(slug, _)| slug == &s.custom_active)
+            .map(|(_, value)| value.as_str())
+            .unwrap_or(label);
+        text_field(
+            g,
+            s,
+            hits,
+            caret,
+            x,
+            *y,
+            (w - 196.0).max(160.0),
+            "커스텀 팔레트 이름",
+            edit_value,
+            SettingsInput::CustomThemeLabel,
+            s.settings_caret,
+            false,
+        );
+        register_clipped(
+            g,
+            hits,
+            Target::Setting(SettingsAction::FocusCustomThemeLabel(s.custom_active.clone())),
+            (x, *y + 18.0, (w - 196.0).max(160.0), 36.0),
+            HitCursor::Text,
+        );
+        button(
+            g,
+            s,
+            hits,
+            (x + w - 184.0, *y + 18.0, 86.0, 36.0),
+            "초기화",
+            Target::Setting(SettingsAction::ResetCustomTheme),
+            false,
+        );
+        button(
+            g,
+            s,
+            hits,
+            (x + w - 92.0, *y + 18.0, 92.0, 36.0),
+            "팔레트 치우기",
+            Target::Setting(SettingsAction::DeleteCustomTheme(s.custom_active.clone())),
+            false,
+        );
+        *y += 72.0;
+        paint_palette_editor(g, s, hits, caret, x, y, w);
+    }
+    paint_device_colors(g, s, hits, caret, x, y, w);
+    row_label(g, x, y, "강조색");
+    let accents: Vec<(String, bool, SettingsAction)> = theme::ACCENT_PRESETS
+        .iter()
+        .map(|(name, _)| {
+            (
+                (*name).to_string(),
+                s.accent == *name,
+                SettingsAction::Accent((*name).to_string()),
+            )
+        })
+        .collect();
+    chips_owned(g, s, hits, x, y, w, accents);
+    // lite 는 색까지만 — 형태·글자·배율·탭 위치는 본판의 일이다.
+    if crate::lite_mode() {
+        return;
+    }
+    let shapes: Vec<(&str, bool, SettingsAction)> = theme::SHAPE_PRESETS
+        .iter()
+        .map(|(key, label, _)| (*label, s.shape == *key, SettingsAction::Shape(key)))
+        .collect();
+    seg_row(g, s, hits, x, y, w, "모서리 형태", &shapes);
+    let contrast: Vec<(&str, bool, SettingsAction)> = theme::CONTRAST_PRESETS
+        .iter()
+        .map(|(label, value)| {
+            (
+                *label,
+                (s.min_contrast - *value).abs() < 0.01,
+                SettingsAction::MinContrast(label),
+            )
+        })
+        .collect();
+    seg_row(g, s, hits, x, y, w, "최소 대비", &contrast);
+    stepper_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "글자 크기",
+        &format!("{:.0}px", s.font_size),
+        SettingsAction::FontSizeDelta(-1),
+        SettingsAction::FontSizeDelta(1),
+    );
+    stepper_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "UI 배율",
+        &format!("{:.0}%", s.ui_zoom * 100.0),
+        SettingsAction::UiZoomDelta(-1),
+        SettingsAction::UiZoomDelta(1),
+    );
+    // 크롬 글꼴. 터미널 격자와 별개다 — 격자는 고정폭이어야 하지만 탭·설정·상태줄은
+    // 산세리프가 더 잘 읽힌다. 바로 먹고 재시작이 필요 없다.
+    dropdown_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "UI 글꼴",
+        &ui_font_label(&s.ui_font),
+        DropdownId::UiFont,
+    );
+    seg_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "탭 위치",
+        &[
+            ("위", s.tabs_on_top, SettingsAction::TabPosition("top")),
+            ("옆", !s.tabs_on_top, SettingsAction::TabPosition("side")),
+        ],
+    );
+    *y += 10.0;
+    button(
+        g,
+        s,
+        hits,
+        (x, *y, 130.0, CTL_H),
+        "배율 1:1로 되돌리기",
+        Target::Setting(SettingsAction::ResetScale),
+        false,
+    );
+    *y += CTL_H + 10.0;
+}
+
+fn paint_statusbar(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "실시간 미리보기 예시",
+        "고른 순서와 색, 구분선을 창 맨 아래와 같은 흐름으로 보여 줍니다",
+    );
+    *y += 54.0;
+    statusbar_preview(g, s, x, *y, w);
+    *y += 80.0;
+
+    section_title(
+        g,
+        x,
+        *y,
+        "표시 항목",
+        "체크는 보이기, 화살표는 순서, 색 칸은 항목의 강조색입니다",
+    );
+    *y += 54.0;
+    for (index, id) in s.statusbar_order.iter().enumerate() {
+        statusbar_widget_row(g, s, hits, x, y, w, id, index);
+    }
+
+    *y += 12.0;
+    section_title(
+        g,
+        x,
+        *y,
+        "사용량에 넣을 정보",
+        "서비스 이름은 유지하고 필요한 수치만 각각 고릅니다",
+    );
+    *y += 54.0;
+    for (provider, title) in [("claude", "Claude"), ("codex", "Codex")] {
+        row_label(g, x, y, title);
+        let selected = s.statusbar_usage_fields.get(provider);
+        let fields = [
+            ("account", "계정 별명"),
+            ("email", "이메일"),
+            ("session", "5시간"),
+            ("weekly", "7일"),
+            ("model", "모델별 한도"),
+        ];
+        let choices = fields
+            .into_iter()
+            .map(|(field, label)| {
+                (
+                    label.to_string(),
+                    selected.is_some_and(|values| values.iter().any(|value| value == field)),
+                    SettingsAction::ToggleStatusbarUsageField(
+                        provider.to_string(),
+                        field.to_string(),
+                    ),
+                )
+            })
+            .collect();
+        chips_owned(g, s, hits, x, y, w, choices);
+        *y += 4.0;
+    }
+
+    toggle_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "묶음 사이 구분선",
+        s.statusbar_separators,
+        SettingsAction::ToggleStatusbarSeparators,
+    );
+    draw_text(
+        g,
+        x + 12.0,
+        *y - 9.0,
+        "계정 · 작업 정보 · 기기 상태가 바뀌는 자리만 얇게 나눕니다",
+        10.5,
+        theme::text_mute(),
+        false,
+    );
+    *y += 16.0;
+    button(
+        g,
+        s,
+        hits,
+        (x, *y, 132.0, 34.0),
+        "기본값으로",
+        Target::Setting(SettingsAction::ResetStatusbar),
+        false,
+    );
+    *y += 48.0;
+}
+
+fn statusbar_widget_label(id: &str) -> &'static str {
+    match id {
+        "claude" => "Claude 사용량",
+        "codex" => "Codex 사용량",
+        "ports" => "열린 포트",
+        "pet" => "펫 상태",
+        "clipboard" => "클립보드",
+        "resources" => "기기 상태",
+        "tunnel" => "모바일 연결",
+        "link" => "기기 연결",
+        "version" => "앱 버전",
+        _ => "알 수 없는 항목",
+    }
+}
+
+fn statusbar_preview_text(s: &Snapshot, id: &str) -> String {
+    if matches!(id, "claude" | "codex") {
+        let mut parts = vec![if id == "claude" { "Claude" } else { "Codex" }.to_string()];
+        let fields = s.statusbar_usage_fields.get(id);
+        for field in crate::statusbar_config::USAGE_FIELDS {
+            if !fields.is_some_and(|values| values.iter().any(|value| value == field)) {
+                continue;
+            }
+            let value = match (id, field) {
+                ("claude", "account") => "지메일",
+                ("codex", "account") => "개인",
+                (_, "email") => "me@example.com",
+                ("claude", "session") => "5h 42%",
+                ("codex", "session") => "5h 미제공",
+                (_, "weekly") => "7d 68%",
+                ("claude", "model") => "Fable 24%",
+                ("codex", "model") => "모델별 미제공",
+                _ => continue,
+            };
+            parts.push(crate::native_strings::text(value).into_owned());
+        }
+        return parts.join(" ");
+    }
+    match id {
+        "ports" => ":3000 · :5173",
+        "pet" => "펫 2명",
+        "clipboard" => "클립보드",
+        "resources" => "CPU 18% · RAM 42%",
+        "tunnel" => "모바일 연결됨",
+        "link" => "나쵸네코 직통 10ms",
+        "version" => "v0.2.0",
+        _ => "",
+    }
+    .to_string()
+}
+
+fn statusbar_preview_group(id: &str) -> u8 {
+    crate::statusbar_config::group(id)
+}
+
+fn statusbar_item_color(s: &Snapshot, id: &str) -> [u8; 4] {
+    s.statusbar_colors
+        .get(id)
+        .and_then(|value| theme::parse_hex(value))
+        .map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
+        .unwrap_or_else(theme::text_dim)
+}
+
+fn statusbar_preview(g: &mut gpu::GpuRenderer, s: &Snapshot, x: f32, y: f32, w: f32) {
+    let rect = (x, y, w, 64.0);
+    stroke_round(g, rect, theme::radius_md(), theme::border());
+    draw_text(
+        g,
+        rect.0 + 12.0,
+        rect.1 + 9.0,
+        "창 맨 아래 · 예시",
+        10.5,
+        theme::text_mute(),
+        false,
+    );
+    let bar = (rect.0 + 8.0, rect.1 + 31.0, rect.2 - 16.0, 25.0);
+    round_rect(
+        g,
+        bar.0,
+        bar.1,
+        bar.2,
+        bar.3,
+        theme::radius_sm(),
+        theme::surface_hover(),
+    );
+    g.push_clip(bar.0 + 7.0, bar.1, (bar.2 - 14.0).max(0.0), bar.3);
+    let right = bar.0 + bar.2 - 7.0;
+    let mut cx = bar.0 + 7.0;
+    let mut last_group = None;
+    let visible: Vec<&String> = s
+        .statusbar_order
+        .iter()
+        .filter(|id| !s.statusbar_hidden.contains(id.as_str()))
+        .collect();
+    if visible.is_empty() {
+        draw_text(
+            g,
+            cx,
+            bar.1 + 8.0,
+            "표시 항목 없음",
+            10.5,
+            theme::text_mute(),
+            false,
+        );
+    }
+    for id in visible {
+        let group = statusbar_preview_group(id);
+        if last_group.is_some_and(|previous| previous != group) {
+            cx += 8.0;
+            if s.statusbar_separators {
+                g.rect(cx, bar.1 + 6.0, 1.0, bar.3 - 12.0, theme::border());
+                cx += 9.0;
+            }
+        }
+        let available = right - cx;
+        if available < 28.0 {
+            break;
+        }
+        let text = statusbar_preview_text(s, id);
+        let shown = fit(g, &text, available, 10.5, false);
+        draw_text(
+            g,
+            cx,
+            bar.1 + 8.0,
+            &shown,
+            10.5,
+            statusbar_item_color(s, id),
+            false,
+        );
+        cx += g.measure_chrome_text(&shown, 10.5, false) + 14.0;
+        last_group = Some(group);
+    }
+    g.pop_clip();
+}
+
+fn statusbar_widget_row(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    id: &str,
+    index: usize,
+) {
+    let rect = (x, *y, w, 70.0);
+    stroke_round(g, rect, theme::radius_md(), theme::border());
+    let visible = !s.statusbar_hidden.contains(id);
+    let check = (rect.0 + 10.0, rect.1 + 9.0, 28.0, 28.0);
+    g.queue_icon(
+        if visible { "square-check" } else { "square" },
+        check.0 + 5.0,
+        check.1 + 5.0,
+        17.0,
+        if visible {
+            theme::accent()
+        } else {
+            theme::text_mute()
+        },
+    );
+    register_clipped(
+        g,
+        hits,
+        Target::Setting(SettingsAction::ToggleStatusbarItem(id.to_string())),
+        (rect.0 + 6.0, rect.1 + 5.0, (rect.2 - 86.0).max(38.0), 36.0),
+        HitCursor::Pointer,
+    );
+    g.hover_pointer |= contains(
+        (
+            rect.0 + 6.0,
+            rect.1 + 5.0,
+            (rect.2 - 86.0).max(38.0),
+            36.0,
+        ),
+        s.cursor,
+    );
+    let label = fit(g, statusbar_widget_label(id), (rect.2 - 124.0).max(34.0), 12.0, visible);
+    draw_text(
+        g,
+        rect.0 + 43.0,
+        rect.1 + 17.0,
+        &label,
+        12.0,
+        if visible {
+            theme::text()
+        } else {
+            theme::text_mute()
+        },
+        visible,
+    );
+    let up = (rect.0 + rect.2 - 68.0, rect.1 + 8.0, 28.0, 28.0);
+    let down = (rect.0 + rect.2 - 36.0, rect.1 + 8.0, 28.0, 28.0);
+    let can_up = index > 0
+        && crate::statusbar_config::group(&s.statusbar_order[index - 1])
+            == crate::statusbar_config::group(id);
+    let can_down = index + 1 < s.statusbar_order.len()
+        && crate::statusbar_config::group(&s.statusbar_order[index + 1])
+            == crate::statusbar_config::group(id);
+    statusbar_move_button(g, s, hits, up, id, -1, can_up, "arrow-up");
+    statusbar_move_button(
+        g,
+        s,
+        hits,
+        down,
+        id,
+        1,
+        can_down,
+        "arrow-down",
+    );
+
+    draw_text(g, rect.0 + 12.0, rect.1 + 49.0, "색", 10.5, theme::text_mute(), false);
+    let selected = s.statusbar_colors.get(id).map(String::as_str).unwrap_or("");
+    let mut sx = rect.0 + 39.0;
+    let swatch_w = if rect.2 < 220.0 { 18.0 } else { 22.0 };
+    let swatch_gap = if rect.2 < 220.0 { 4.0 } else { 7.0 };
+    let swatches: Vec<(String, [u8; 4])> = std::iter::once((String::new(), theme::text_dim()))
+        .chain(theme::ACCENT_PRESETS.iter().map(|(_, color)| {
+            (
+                format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]),
+                *color,
+            )
+        }))
+        .collect();
+    for (value, color) in swatches {
+        let sr = (sx, rect.1 + 43.0, swatch_w, 18.0);
+        let on = selected.eq_ignore_ascii_case(&value);
+        round_rect(g, sr.0, sr.1, sr.2, sr.3, 5.0, color);
+        if on {
+            stroke_round(g, (sr.0 - 2.0, sr.1 - 2.0, sr.2 + 4.0, sr.3 + 4.0), 7.0, theme::text());
+        }
+        register_clipped(
+            g,
+            hits,
+            Target::Setting(SettingsAction::SetStatusbarColor(id.to_string(), value)),
+            (sr.0 - 2.0, sr.1 - 2.0, sr.2 + 4.0, sr.3 + 4.0),
+            HitCursor::Pointer,
+        );
+        g.hover_pointer |= contains(
+            (sr.0 - 2.0, sr.1 - 2.0, sr.2 + 4.0, sr.3 + 4.0),
+            s.cursor,
+        );
+        sx += swatch_w + swatch_gap;
+    }
+    *y += rect.3 + 7.0;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn statusbar_move_button(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    rect: Rect,
+    id: &str,
+    delta: i8,
+    enabled: bool,
+    icon: &str,
+) {
+    let hover = enabled && contains(rect, s.cursor);
+    if hover {
+        round_rect(
+            g,
+            rect.0,
+            rect.1,
+            rect.2,
+            rect.3,
+            theme::radius_sm(),
+            theme::surface_active(),
+        );
+    }
+    g.queue_icon(
+        icon,
+        rect.0 + 7.0,
+        rect.1 + 7.0,
+        14.0,
+        if enabled {
+            theme::text_dim()
+        } else {
+            theme::with_alpha(theme::text_mute(), 80)
+        },
+    );
+    if enabled {
+        register_clipped(
+            g,
+            hits,
+            Target::Setting(SettingsAction::MoveStatusbarItem(id.to_string(), delta)),
+            rect,
+            HitCursor::Pointer,
+        );
+        g.hover_pointer |= hover;
+    }
+}
+
+fn paint_palette_editor(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "팔레트 색",
+        "색 칸을 고른 뒤 휠이나 #rrggbb 값으로 바꿉니다",
+    );
+    *y += 54.0;
+    let selected = match s.input {
+        Some(SettingsInput::PaletteHex(index)) => index.min(s.palette_hex.len().saturating_sub(1)),
+        _ => 0,
+    };
+    let slot_label = if selected < theme::PALETTE_KEYS.len() {
+        theme::PALETTE_KEYS[selected].0.to_string()
+    } else {
+        format!("ANSI {}", selected.saturating_sub(theme::PALETTE_KEYS.len()))
+    };
+    let value = if s.input == Some(SettingsInput::PaletteHex(selected)) {
+        s.palette_edit.clone()
+    } else {
+        s.palette_hex.get(selected).cloned().unwrap_or_else(|| "#000000".to_string())
+    };
+    *y += paint_color_picker(
+        g,
+        s,
+        hits,
+        caret,
+        x,
+        *y,
+        w,
+        SettingsInput::PaletteHex(selected),
+        &slot_label,
+        &value,
+        s.eyedropper.then(|| SettingsAction::PaletteEyedropper(selected)),
+    );
+
+    let swatch_w = 31.0;
+    let gap = 7.0;
+    let cols = ((w + gap) / (swatch_w + gap)).floor().max(1.0) as usize;
+    for (index, hex) in s.palette_hex.iter().enumerate() {
+        let rect = (
+            x + (index % cols) as f32 * (swatch_w + gap),
+            *y + (index / cols) as f32 * 36.0,
+            swatch_w,
+            28.0,
+        );
+        round_rect(
+            g,
+            rect.0,
+            rect.1,
+            rect.2,
+            rect.3,
+            theme::radius_sm(),
+            theme::parse_hex(hex)
+                .map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
+                .unwrap_or([0, 0, 0, 255]),
+        );
+        stroke_round(
+            g,
+            rect,
+            theme::radius_sm(),
+            if index == selected { theme::accent() } else { theme::border() },
+        );
+        register_clipped(
+            g,
+            hits,
+            Target::Setting(SettingsAction::FocusPaletteHex(index)),
+            rect,
+            HitCursor::Pointer,
+        );
+    }
+    let rows = (s.palette_hex.len() + cols - 1) / cols;
+    *y += rows as f32 * 36.0 + 18.0;
+}
+
+/// 색 선택기 한 벌 — 채도×명도 면·색상 띠·HEX 칸·스포이드. 팔레트 칸과 기기색이
+/// **같은 것**을 쓴다: 고르는 손놀림이 자리마다 다르면 한쪽에서 익힌 것이 다른
+/// 쪽에서 안 통한다. 쓴 높이를 돌려준다.
+#[allow(clippy::too_many_arguments)]
+fn paint_color_picker(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: f32,
+    w: f32,
+    field: SettingsInput,
+    slot_label: &str,
+    value: &str,
+    eyedropper: Option<SettingsAction>,
+) -> f32 {
+    let (hue, sat, val) = s.picker_hsv;
+    let wheel_w = w.min(310.0).max(180.0);
+    let sv = (x, y, wheel_w, 132.0);
+    let cells_x = 24;
+    let cells_y = 12;
+    for row in 0..cells_y {
+        for col in 0..cells_x {
+            let saturation = (col + 1) as f32 / cells_x as f32;
+            let value = 1.0 - row as f32 / cells_y as f32;
+            let rgb = hsv_rgb(hue, saturation, value);
+            g.rect(
+                sv.0 + col as f32 * sv.2 / cells_x as f32,
+                sv.1 + row as f32 * sv.3 / cells_y as f32,
+                sv.2 / cells_x as f32 + 0.5,
+                sv.3 / cells_y as f32 + 0.5,
+                [rgb[0], rgb[1], rgb[2], 255],
+            );
+        }
+    }
+    stroke_rect(g, sv, theme::border());
+    let marker_x = sv.0 + sat * sv.2;
+    let marker_y = sv.1 + (1.0 - val) * sv.3;
+    stroke_rect(g, (marker_x - 4.0, marker_y - 4.0, 8.0, 8.0), [255, 255, 255, 255]);
+    register_clipped(
+        g,
+        hits,
+        Target::Setting(SettingsAction::PickerSV),
+        sv,
+        HitCursor::Pointer,
+    );
+
+    let hue_rect = (x, y + 141.0, wheel_w, 18.0);
+    for col in 0..60 {
+        let rgb = hsv_rgb(col as f32 * 6.0, 1.0, 1.0);
+        g.rect(
+            hue_rect.0 + col as f32 * hue_rect.2 / 60.0,
+            hue_rect.1,
+            hue_rect.2 / 60.0 + 0.5,
+            hue_rect.3,
+            [rgb[0], rgb[1], rgb[2], 255],
+        );
+    }
+    stroke_rect(g, hue_rect, theme::border());
+    g.rect(
+        hue_rect.0 + (hue / 360.0) * hue_rect.2 - 1.0,
+        hue_rect.1 - 2.0,
+        2.0,
+        hue_rect.3 + 4.0,
+        [255, 255, 255, 255],
+    );
+    register_clipped(
+        g,
+        hits,
+        Target::Setting(SettingsAction::PickerHue),
+        hue_rect,
+        HitCursor::Pointer,
+    );
+    let field_x = x + wheel_w + 16.0;
+    let field_w = (w - wheel_w - 16.0).max(110.0);
+    draw_text(g, field_x, y + 4.0, slot_label, 12.0, theme::text(), true);
+    text_field(
+        g,
+        s,
+        hits,
+        caret,
+        field_x,
+        y + 28.0,
+        field_w,
+        "HEX",
+        value,
+        field,
+        s.settings_caret,
+        false,
+    );
+    if let Some(action) = eyedropper {
+        button(
+            g,
+            s,
+            hits,
+            (field_x, y + 91.0, field_w.min(126.0), 34.0),
+            "화면에서 색 집기",
+            Target::Setting(action),
+            false,
+        );
+    }
+    178.0
+}
+
+/// 기기별 색 — 이 기기와 명부의 기계 한 줄씩. 줄을 고르면 프리셋과 선택기가
+/// 그 밑에 펼쳐진다. 색은 pane 헤더 칩·배치도 칸·정보 탭·거울 pane 바탕이 함께
+/// 쓰므로, 여기서 바꾸면 그 넷이 한꺼번에 따라온다.
+fn paint_device_colors(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "기기 색",
+        "pane 헤더·배치도·정보 탭이 기기를 이 색으로 가릅니다",
+    );
+    *y += 54.0;
+    if s.device_colors.is_empty() {
+        draw_text(
+            g,
+            x + 2.0,
+            *y,
+            "아직 이름을 알아낸 기기가 없어요",
+            11.5,
+            theme::text_dim(),
+            false,
+        );
+        *y += 30.0;
+        return;
+    }
+    let selected = match s.input {
+        Some(SettingsInput::DeviceHex(index)) if index < s.device_colors.len() => Some(index),
+        _ => None,
+    };
+    let to_rgba = |hex: &str| {
+        theme::parse_hex(hex)
+            .map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
+            .unwrap_or([0, 0, 0, 255])
+    };
+    for (index, row) in s.device_colors.iter().enumerate() {
+        let rect = (x, *y, w, 40.0);
+        let is_sel = selected == Some(index);
+        stroke_round(g, rect, theme::radius_md(), if is_sel { theme::accent() } else { theme::border() });
+        let color = to_rgba(&row.hex);
+        let swatch = (x + 8.0, *y + 8.0, 24.0, 24.0);
+        round_rect(g, swatch.0, swatch.1, swatch.2, swatch.3, theme::radius_sm(), color);
+        stroke_round(g, swatch, theme::radius_sm(), theme::edge_on(color));
+        let name = if row.local {
+            format!("{} · 이 기기", row.label)
+        } else {
+            row.label.clone()
+        };
+        let right_w = 176.0;
+        let name_w = (w - 42.0 - right_w).max(60.0);
+        let shown = fit(g, &name, name_w, 12.5, is_sel);
+        draw_text(g, x + 42.0, *y + 12.0, &shown, 12.5, theme::text(), is_sel);
+        let hex_x = x + w - right_w + 8.0;
+        draw_text(g, hex_x, *y + 13.0, &row.hex, 11.0, theme::text_dim(), false);
+        register_clipped(
+            g,
+            hits,
+            Target::Setting(SettingsAction::FocusDeviceHex(index)),
+            rect,
+            HitCursor::Pointer,
+        );
+        if row.custom {
+            button(
+                g,
+                s,
+                hits,
+                (x + w - 78.0, *y + 5.0, 70.0, 30.0),
+                "기본값",
+                Target::Setting(SettingsAction::ResetDeviceColor(index)),
+                false,
+            );
+        } else {
+            draw_text(g, x + w - 62.0, *y + 13.0, "기본값", 11.0, theme::text_mute(), false);
+        }
+        *y += 46.0;
+    }
+    if let Some(index) = selected {
+        let row = &s.device_colors[index];
+        *y += 4.0;
+        row_label(g, x, y, "프리셋 — 서로 갈라 보이는 다섯 색");
+        let mut cx = x;
+        for (_, color) in crate::render::pane_identity::DEVICE_COLOR_PRESETS {
+            let hex = theme::hex_str([color[0], color[1], color[2]]);
+            let is_cur = row.hex.eq_ignore_ascii_case(&hex);
+            let rect = (cx, *y, 34.0, 30.0);
+            round_rect(g, rect.0, rect.1, rect.2, rect.3, theme::radius_sm(), *color);
+            stroke_round(
+                g,
+                rect,
+                theme::radius_sm(),
+                if is_cur { theme::text() } else { theme::edge_on(*color) },
+            );
+            if is_cur {
+                stroke_round(g, (rect.0 + 2.0, rect.1 + 2.0, rect.2 - 4.0, rect.3 - 4.0), (theme::radius_sm() - 2.0).max(0.0), theme::bg());
+            }
+            register_clipped(
+                g,
+                hits,
+                Target::Setting(SettingsAction::DevicePreset(index, hex)),
+                rect,
+                HitCursor::Pointer,
+            );
+            cx += 41.0;
+        }
+        *y += 42.0;
+        let value = if s.input == Some(SettingsInput::DeviceHex(index)) {
+            s.palette_edit.clone()
+        } else {
+            row.hex.clone()
+        };
+        *y += paint_color_picker(
+            g,
+            s,
+            hits,
+            caret,
+            x,
+            *y,
+            w,
+            SettingsInput::DeviceHex(index),
+            &row.label,
+            &value,
+            s.eyedropper.then(|| SettingsAction::DeviceEyedropper(index)),
+        );
+        draw_text(
+            g,
+            x + 2.0,
+            *y - 12.0,
+            "HEX 칸은 #rrggbb 말고 rgb(r, g, b) · r, g, b 도 받아요",
+            10.5,
+            theme::text_dim(),
+            false,
+        );
+        *y += 10.0;
+    }
+    button(
+        g,
+        s,
+        hits,
+        (x, *y, 172.0, 34.0),
+        "모든 기기 색 기본값으로",
+        Target::Setting(SettingsAction::ResetAllDeviceColors),
+        false,
+    );
+    *y += 50.0;
+}
+
+fn hsv_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let h = h.rem_euclid(360.0) / 60.0;
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    [
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    ]
+}
+
+/// 「터미널」 페이지의 커서 절. 목업 IA(셸+커서→터미널)대로 「모양」에서 여기로
+/// 옮겼다 — 커서는 색·글꼴이 아니라 pane 안 동작이라 셸 옆이 맞다.
+fn paint_cursor(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "커서",
+        "모양만 고르면 색은 현재 캐릭터를 따라가요",
+    );
+    *y += 54.0;
+    draw_text(g, x + 2.0, *y, "기본", 11.5, theme::text_dim(), true);
+    *y += 24.0;
+    cursor_shape_grid(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        &[
+            (cursor::CursorShape::Block, "블록"),
+            (cursor::CursorShape::Bar, "빔"),
+            (cursor::CursorShape::Underline, "밑줄"),
+        ],
+    );
+    let everyday = [
+        cursor::CursorShape::Block,
+        cursor::CursorShape::Bar,
+        cursor::CursorShape::Underline,
+    ];
+    if !everyday.contains(&s.cursor_shape) {
+        *y += 8.0;
+        draw_text(
+            g,
+            x + 2.0,
+            *y,
+            "고급 · 기존 설정",
+            11.5,
+            theme::text_dim(),
+            true,
+        );
+        *y += 24.0;
+        cursor_shape_grid(
+            g,
+            s,
+            hits,
+            x,
+            y,
+            w,
+            &[(s.cursor_shape, cursor_shape_label(s.cursor_shape))],
+        );
+    }
+    *y += 8.0;
+    // 고른 열 밑에만 미리보기를 두면 선택을 바꿀 때 카드가 좌우로 뛰고, 좁은
+    // 화면에서는 다음 섹션과 한 묶음처럼 붙는다. 한 줄 전체를 고정해 결과와
+    // 선택지를 시각적으로 갈라 둔다.
+    let preview = (x, *y, w, 68.0);
+    stroke_round(g, preview, theme::radius_md(), theme::border());
+    draw_text(
+        g,
+        preview.0 + 12.0,
+        preview.1 + 10.0,
+        "실제 깜빡임",
+        10.5,
+        theme::text_dim(),
+        false,
+    );
+    let selected = cursor_shape_label(s.cursor_shape);
+    draw_text(
+        g,
+        preview.0 + 12.0,
+        preview.1 + 35.0,
+        selected,
+        12.0,
+        theme::text(),
+        true,
+    );
+    if s.caret_on {
+        cursor_sample(
+            g,
+            s.cursor_shape,
+            preview.0 + preview.2 - 55.0,
+            preview.1 + 18.0,
+            s.cursor_thickness,
+            false,
+            s.cursor_color,
+        );
+    }
+    *y += 84.0;
+    let thickness: Vec<(&str, bool, SettingsAction)> = [1u8, 2, 3, 4, 6]
+        .iter()
+        .map(|px| {
+            let label = match px {
+                1 => "1px",
+                2 => "2px",
+                3 => "3px",
+                4 => "4px",
+                _ => "6px",
+            };
+            (
+                label,
+                (s.cursor_thickness - *px as f32).abs() < 0.1,
+                SettingsAction::CursorThickness(*px),
+            )
+        })
+        .collect();
+    if s.cursor_shape == cursor::CursorShape::Block {
+        draw_text(
+            g,
+            x + 2.0,
+            *y + 10.0,
+            "블록은 셀 전체를 채워 굵기를 쓰지 않아요",
+            11.5,
+            theme::text_mute(),
+            false,
+        );
+        *y += 42.0;
+    } else {
+        seg_row(g, s, hits, x, y, w, "선 굵기", &thickness);
+    }
+    *y += 12.0;
+    seg_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "마우스 포인터",
+        &[
+            (
+                "화살표",
+                s.mouse_cursor != "ibeam",
+                SettingsAction::MouseCursor("arrow"),
+            ),
+            (
+                "I-빔",
+                s.mouse_cursor == "ibeam",
+                SettingsAction::MouseCursor("ibeam"),
+            ),
+        ],
+    );
+    *y += 8.0;
+}
+
+fn paint_shell(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(g, x, *y, "셸", "");
+    *y += 54.0;
+    let known = matches!(s.shell.as_str(), "" | "/bin/zsh" | "/bin/bash");
+    seg_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "새 pane의 셸",
+        &[
+            (
+                "시스템 기본",
+                s.shell.is_empty(),
+                SettingsAction::ShellPreset(String::new()),
+            ),
+            (
+                "zsh",
+                s.shell == "/bin/zsh",
+                SettingsAction::ShellPreset("/bin/zsh".to_string()),
+            ),
+            (
+                "bash",
+                s.shell == "/bin/bash",
+                SettingsAction::ShellPreset("/bin/bash".to_string()),
+            ),
+        ],
+    );
+    text_field(
+        g,
+        s,
+        hits,
+        caret,
+        x,
+        *y,
+        w,
+        "직접 경로",
+        if known { "" } else { &s.shell },
+        SettingsInput::Shell,
+        s.settings_caret,
+        false,
+    );
+    *y += 64.0;
+    info_slab(
+        g,
+        x,
+        y,
+        w,
+        "셸 경로는 실행 파일 하나만 적습니다. 명령 옵션은 각 pane에서 직접 붙여 주세요.",
+    );
+    *y += 16.0;
+    paint_cursor(g, s, hits, x, y, w);
+}
+
+fn paint_claude(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "Agent 기본값",
+        "새로 띄우는 Claude와 Codex 작업대에 적용됩니다",
+    );
+    *y += 54.0;
+    toggle_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "캐릭터 성격 넣기",
+        s.claude_persona,
+        SettingsAction::ToggleClaudePersona,
+    );
+    toggle_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "협업 연결 넣기",
+        s.shim_inject,
+        SettingsAction::ToggleShimInject,
+    );
+    let models = [
+        ("기본", ""),
+        ("Opus", "opus"),
+        ("Sonnet", "sonnet"),
+        ("Haiku", "haiku"),
+    ];
+    let model_cells: Vec<(&str, bool, SettingsAction)> = models
+        .iter()
+        .map(|(label, key)| {
+            (
+                *label,
+                s.claude_model == *key,
+                SettingsAction::ClaudeModel((*key).to_string()),
+            )
+        })
+        .collect();
+    seg_row(g, s, hits, x, y, w, "모델", &model_cells);
+    let efforts = [
+        ("기본", ""),
+        ("낮게", "low"),
+        ("보통", "medium"),
+        ("높게", "high"),
+        ("아주 높게", "xhigh"),
+    ];
+    let effort_cells: Vec<(&str, bool, SettingsAction)> = efforts
+        .iter()
+        .map(|(label, key)| {
+            (
+                *label,
+                s.claude_effort == *key,
+                SettingsAction::ClaudeEffort((*key).to_string()),
+            )
+        })
+        .collect();
+    seg_row(g, s, hits, x, y, w, "생각 깊이", &effort_cells);
+    text_field(
+        g,
+        s,
+        hits,
+        caret,
+        x,
+        *y,
+        w,
+        "추가 인자",
+        &s.claude_extra,
+        SettingsInput::ClaudeExtra,
+        s.settings_caret,
+        false,
+    );
+    *y += 66.0;
+
+}
+
+/// 계정 칸. 모델 기본값과 한 화면에 있던 것을 뺐다 — 로그인과 제거는 위쪽
+/// 토글들과 되돌리기 무게가 다르고, 계정을 보러 온 사람이 스크롤을 내려야 했다.
+fn paint_accounts(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    account_group(g, s, hits, caret, x, y, w, AccountProvider::Claude);
+    *y += 14.0;
+    let switch_home = s.home_accounts.as_ref().filter(|_| s.account_scope_home);
+    let switch_on = switch_home.map_or(s.account_autoswitch, |h| h.autoswitch);
+    let switch_accounts = switch_home.map_or(s.accounts.as_ref(), |h| h.accounts.as_ref());
+    let named_count = switch_accounts.iter().filter(|row| row.provider == AccountProvider::Claude && !row.id.is_empty()).count();
+    if named_count >= 2 || switch_on {
+        toggle_row(
+            g,
+            s,
+            hits,
+            x,
+            y,
+            w,
+            "한도에 맞춰 자동 전환",
+            switch_on,
+            SettingsAction::ToggleAccountAutoswitch,
+        );
+    } else {
+        flat_row(g, x, *y, w, "한도에 맞춰 자동 전환", "Claude 계정을 2개 이상 등록하면 켤 수 있어요", w);
+        *y += ROW_H;
+    }
+    let switch_pct = switch_home
+        .map_or(s.account_autoswitch_pct, |h| h.autoswitch_pct)
+        .round() as u32;
+    if switch_on {
+        seg_row(
+            g,
+            s,
+            hits,
+            x,
+            y,
+            w,
+            "전환 기준",
+            &[
+                (
+                    "80%",
+                    switch_pct == 80,
+                    SettingsAction::AccountAutoswitchPct(80),
+                ),
+                (
+                    "85%",
+                    switch_pct == 85,
+                    SettingsAction::AccountAutoswitchPct(85),
+                ),
+                (
+                    "90%",
+                    switch_pct == 90,
+                    SettingsAction::AccountAutoswitchPct(90),
+                ),
+                (
+                    "95%",
+                    switch_pct == 95,
+                    SettingsAction::AccountAutoswitchPct(95),
+                ),
+            ],
+        );
+    }
+    *y += 14.0;
+    account_group(g, s, hits, caret, x, y, w, AccountProvider::Codex);
+}
+
+/// 명부 한 줄을 화면에 옮긴 것. 파일 형식(다른 필드가 여럿 딸린 json)을 그대로
+/// 들고 다니지 않는 것은, 화면이 만지는 것이 이름과 ssh 두 칸뿐이고 나머지는
+/// **손대지 않고 되돌려 써야** 하기 때문이다 — 손으로 적은 옛 항목이 있다.
+pub(crate) struct MachineRow {
+    pub(crate) label: String,
+    pub(crate) ssh: String,
+    pub(crate) status: String,
+    pub(crate) online: bool,
+    pub(crate) build_match: bool,
+    /// 전송 스크립트가 쓸 명부 원문의 ssh/host. 화면용 `ssh`에는 설명이 붙을 수 있다.
+    pub(crate) sync_target: String,
+    /// 앱이 찾아 적어 둔 ssh 열쇠 파일 이름(없으면 빈값) — 왜 붙는지 보이게.
+    pub(crate) key: String,
+    /// 상대가 터널을 들고 알려 온 기계 — 명부 파일에 없어 고치거나 지울 것이 없다.
+    pub(crate) guest: bool,
+}
+
+impl Clone for MachineRow {
+    fn clone(&self) -> Self {
+        Self {
+            label: self.label.clone(),
+            ssh: self.ssh.clone(),
+            status: self.status.clone(),
+            online: self.online,
+            build_match: self.build_match,
+            sync_target: self.sync_target.clone(),
+            key: self.key.clone(),
+            guest: self.guest,
+        }
+    }
+}
+
+/// 살아 있고 빌드가 같아야 「연결됨」 한 마디로 끝난다. 빌드가 다르면(또는 옛 판이라
+/// 표식이 없으면) 그 사실을 배지에 같이 쓴다 — 창구가 다른 판끼리는 `to` 가 창 없는
+/// 셸로 물러서거나 조용히 어긋나므로, 보이는 자리에 서야 한다.
+fn machine_status(
+    online: bool,
+    build_match: bool,
+    build: Option<&str>,
+    ago: Option<u64>,
+) -> String {
+    if online {
+        if build_match {
+            "연결됨".to_string()
+        } else {
+            let build = build
+                .filter(|value| !value.is_empty())
+                .map(|value| value.chars().take(8).collect::<String>())
+                .unwrap_or_else(|| "표식 없음".to_string());
+            format!("연결됨 · 빌드 {build} ≠ 현재")
+        }
+    } else {
+        match ago {
+            Some(sec) if sec < 90 => "방금 끊김".to_string(),
+            Some(sec) if sec < 3600 => format!("{}분 전", sec / 60),
+            Some(sec) => format!("{}시간 전", sec / 3600),
+            None => "아직 안 닿음".to_string(),
+        }
+    }
+}
+
+/// 명부와 그 연결 상태를 합쳐 읽는다. 파일과 잠금을 매 프레임 건드리지 않게 잠깐
+/// 쥐고 있는다 — 이 화면은 크롬이라 pane 이 출력하는 동안에도 계속 돈다.
+fn machines_view() -> Vec<MachineRow> {
+    if crate::verification_run()
+        && std::env::var_os("KASATERM_TEST_MACHINE_MISMATCH").is_some()
+    {
+        return vec![MachineRow {
+            label: "본진".to_string(),
+            ssh: "nachoneko".to_string(),
+            status: machine_status(true, false, Some("deadbeef"), None),
+            online: true,
+            build_match: false,
+            sync_target: "nachoneko".to_string(),
+            key: "id_ed25519".to_string(),
+            guest: false,
+        }];
+    }
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Cache = Mutex<Option<(Instant, Vec<MachineRow>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Cache::default);
+    if let Ok(g) = cache.lock() {
+        if let Some((at, rows)) = g.as_ref() {
+            if at.elapsed() < Duration::from_secs(2) {
+                return rows.clone();
+            }
+        }
+    }
+    let live = kasa_mcp::machines::snapshot();
+    let mut rows: Vec<MachineRow> = kasa_mcp::machines::entries()
+        .iter()
+        .map(|e| {
+            let label = e.get("label").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            // 손으로 적은 옛 항목은 ssh 대신 `host` 에 주소를 두고 `base` 로
+            // 터널을 따로 든다. 그걸 「비어 있다」고 하면 멀쩡히 붙어 있는 기계에
+            // 붉은 경고가 뜬다 — 실제로 어디로 붙는지를 적는다.
+            let sync_target = e
+                .get("ssh")
+                .or_else(|| e.get("host"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_default()
+                .to_string();
+            let ssh = (!sync_target.is_empty())
+                .then(|| sync_target.clone())
+                .or_else(|| {
+                    e.get("base")
+                        .and_then(|v| v.as_str())
+                        .map(|b| format!("{b} (직접 적은 주소)"))
+                })
+                .unwrap_or_default();
+            let hit = live
+                .iter()
+                .find(|m| m.get("label").and_then(|v| v.as_str()) == Some(label.as_str()));
+            let online = hit
+                .and_then(|m| m.get("online"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // 「언제 마지막으로 닿았나」는 「지금 되나」와 다른 물음이다 — 안 닿는
+            // 기계가 5분 전엔 됐다는 것과 한 번도 안 됐다는 것은 할 일이 다르다.
+            let ago = hit.and_then(|m| m.get("ago_secs")).and_then(|v| v.as_u64());
+            let build_match = hit
+                .and_then(|m| m.get("build_match"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let build = hit.and_then(|m| m.get("build")).and_then(|v| v.as_str());
+            let status = machine_status(online, build_match, build, ago);
+            let key = e
+                .get("key")
+                .and_then(|v| v.as_str())
+                .and_then(|k| std::path::Path::new(k).file_name())
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            MachineRow { label, ssh, status, online, build_match, sync_target, key, guest: false }
+        })
+        .collect();
+    // 알려 온 기계 — 파일엔 없지만 `to` 에는 뜨므로 여기도 같이 선다. 이름이 파일
+    // 항목과 겹치면 스냅샷이 이미 파일 쪽만 남겼다.
+    for m in live.iter().filter(|m| m.get("guest").and_then(|v| v.as_bool()).unwrap_or(false)) {
+        let label = m.get("label").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let online = m.get("online").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ago = m.get("ago_secs").and_then(|v| v.as_u64());
+        let build_match = m.get("build_match").and_then(|v| v.as_bool()).unwrap_or(true);
+        let build = m.get("build").and_then(|v| v.as_str());
+        rows.push(MachineRow {
+            label,
+            ssh: "그쪽이 터널로 열어 둔 길 — 이 기계 명부엔 안 적혀요".to_string(),
+            status: machine_status(online, build_match, build, ago),
+            online,
+            build_match,
+            sync_target: String::new(),
+            key: String::new(),
+            guest: true,
+        });
+    }
+    if let Ok(mut g) = cache.lock() {
+        *g = Some((Instant::now(), rows.clone()));
+    }
+    rows
+}
+
+/// 기계 칸. 계정 칸과 같은 모양이다 — 목록 머리에 추가 단추, 줄마다 고치기와
+// 펫은 별도 프로세스라 양쪽이 공유하는 설정을 읽어 우클릭 변경도 여기 반영한다.
+fn paint_pet(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    let on = crate::chrome::pet_pid().is_some();
+    let chars = crate::chrome::pet_characters();
+    let current = crate::chrome::pet_current_character();
+    use kasa_pet_config::PreferenceChange as Change;
+    let prefs = crate::chrome::pet_preferences();
+    let scale = crate::chrome::pet_scale_percent(&prefs);
+
+    // 설명은 줄 안의 힌트로 — 줄 밑에 따로 그리면 구분선을 뚫고 지나갔다.
+    toggle_row_hint(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "바탕화면에 띄우기",
+        "kasaterm을 내려도 바탕화면에 남습니다",
+        on,
+        SettingsAction::TogglePet,
+    );
+    *y += 16.0;
+
+    draw_text(g, x, *y, "캐릭터", 12.5, theme::text(), true);
+    *y += 24.0;
+    if chars.is_empty() {
+        draw_text(
+            g,
+            x,
+            *y,
+            "받아 둔 캐릭터가 없습니다 — 펫을 처음 켜면 받아 옵니다",
+            11.5,
+            theme::text_dim(),
+            false,
+        );
+        *y += 28.0;
+    } else {
+        // 그림이 없는 캐릭터가 있으면 그리는 김에 만들어 둔다 — 펫을 잠깐 띄웠다
+        // 끄는 일이라 화면에 한 번 스친다. 다 있으면 아무 일도 안 한다.
+        crate::chrome::ensure_pet_previews();
+        pet_cards(g, s, hits, x, y, w, &chars, current.as_deref());
+    }
+
+    pet_section(g, x, y, "모습");
+    pet_value_row(g, s, hits, x, y, w, "펫 크기", &format!("{scale}%"),
+        Change::ScalePercent(Some(scale.saturating_sub(10).max(40))),
+        Change::ScalePercent(Some((scale + 10).min(300))));
+    pet_value_row(g, s, hits, x, y, w, "말풍선 글자 크기", &format!("{}pt", prefs.text_pt),
+        Change::TextPt(prefs.text_pt.saturating_sub(1).max(8)),
+        Change::TextPt((prefs.text_pt + 1).min(40)));
+    pet_value_row(g, s, hits, x, y, w, "말풍선 너비", &format!("{}px", prefs.bubble_width),
+        Change::BubbleWidth(prefs.bubble_width.saturating_sub(40).max(240)),
+        Change::BubbleWidth((prefs.bubble_width + 40).min(800)));
+    toggle_row(g, s, hits, x, y, w, "항상 위에 표시", prefs.always_on_top,
+        SettingsAction::PetPreference(Change::AlwaysOnTop(!prefs.always_on_top)));
+
+    pet_section(g, x, y, "움직임");
+    for (label, on, change) in [
+        ("마우스 시선 따라가기", prefs.follow_cursor, Change::FollowCursor(!prefs.follow_cursor)),
+        ("자동 움직임", prefs.animations, Change::Animations(!prefs.animations)),
+        ("위치 고정", prefs.lock_position, Change::LockPosition(!prefs.lock_position)),
+    ] {
+        toggle_row(g, s, hits, x, y, w, label, on, SettingsAction::PetPreference(change));
+    }
+    let sleep = if prefs.sleep_minutes == 0 {
+        crate::native_strings::text("안 함").into_owned()
+    } else {
+        format!("{}{}", prefs.sleep_minutes, crate::native_strings::text("분"))
+    };
+    pet_value_row(g, s, hits, x, y, w, "자동 휴식", &sleep,
+        Change::SleepMinutes(prefs.sleep_minutes.saturating_sub(1)),
+        Change::SleepMinutes((prefs.sleep_minutes + 1).min(60)));
+
+    pet_section(g, x, y, "알림");
+    toggle_row(g, s, hits, x, y, w, "말풍선 표시", prefs.bubbles,
+        SettingsAction::PetPreference(Change::Bubbles(!prefs.bubbles)));
+    toggle_row(g, s, hits, x, y, w, "작업 상태에 반응", prefs.activity_reactions,
+        SettingsAction::PetPreference(Change::ActivityReactions(!prefs.activity_reactions)));
+    pet_value_row(g, s, hits, x, y, w, "말풍선 표시 시간",
+        &format!("{}{}", prefs.say_seconds, crate::native_strings::text("초")),
+        Change::SaySeconds(prefs.say_seconds.saturating_sub(1).max(3)),
+        Change::SaySeconds((prefs.say_seconds + 1).min(60)));
+    toggle_row(g, s, hits, x, y, w, "먼저 말 걸기", prefs.chatter,
+        SettingsAction::PetPreference(Change::Chatter(!prefs.chatter)));
+    if prefs.chatter {
+        pet_value_row(g, s, hits, x, y, w, "말 거는 간격",
+            &format!("{}{}", prefs.chatter_seconds, crate::native_strings::text("초")),
+            Change::ChatterSeconds(prefs.chatter_seconds.saturating_sub(5).max(5)),
+            Change::ChatterSeconds((prefs.chatter_seconds + 5).min(120)));
+    }
+
+    pet_section(g, x, y, "펫 조작");
+    for text in [
+        "클릭으로 쓰다듬기 · 끌어서 자리 옮기기",
+        "두 번 클릭해 캐릭터 바꾸기 · 휠로 크기 조절",
+        "우클릭으로 행동 선택과 기능 켜고 끄기",
+    ] {
+        let text = fit(g, text, w, 11.0, false);
+        draw_text(g, x, *y, &text, 11.0, theme::text_dim(), false);
+        *y += 22.0;
+    }
+}
+
+fn pet_section(g: &mut gpu::GpuRenderer, x: f32, y: &mut f32, title: &str) {
+    *y += 18.0;
+    draw_text(g, x, *y, title, 12.5, theme::text(), true);
+    *y += 24.0;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pet_value_row(
+    g: &mut gpu::GpuRenderer, s: &Snapshot, hits: &mut Vec<Hit>,
+    x: f32, y: &mut f32, w: f32, label: &str, value: &str,
+    minus: kasa_pet_config::PreferenceChange, plus: kasa_pet_config::PreferenceChange,
+) {
+    let translated = crate::native_strings::text(label);
+    let label = if g.measure_chrome_text(&translated, 12.5, false) + 120.0 > w {
+        let shown = fit(g, label, w, 12.5, false);
+        draw_text(g, x + 2.0, *y + 8.0, &shown, 12.5, theme::text(), false);
+        *y += 28.0;
+        ""
+    } else {
+        label
+    };
+    stepper_row(g, s, hits, x, y, w, label, value,
+        SettingsAction::PetPreference(minus), SettingsAction::PetPreference(plus));
+}
+
+/// 캐릭터 카드 — 그림과 이름. 이름만 늘어놓으면 「Ren 이 누구였더라」가 되는데,
+/// 이건 눈으로 고르는 값이다.
+fn pet_cards(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    names: &[String],
+    current: Option<&str>,
+) {
+    const CARD_W: f32 = 92.0;
+    const CARD_H: f32 = 132.0;
+    let gap = 8.0;
+    let per_row = (((w + gap) / (CARD_W + gap)).floor() as usize).max(1);
+    for (i, name) in names.iter().enumerate() {
+        let (col, row) = (i % per_row, i / per_row);
+        let rect = (
+            x + col as f32 * (CARD_W + gap),
+            *y + row as f32 * (CARD_H + gap),
+            CARD_W,
+            CARD_H,
+        );
+        let selected = Some(name.as_str()) == current;
+        choice_card(
+            g,
+            s,
+            hits,
+            rect,
+            selected,
+            Target::Setting(SettingsAction::PetCharacter(name.clone())),
+        );
+        // 그림은 카드보다 조금 작게 — 테두리에 딱 붙으면 골라진 표시가 안 보인다.
+        if let Some(path) = crate::chrome::pet_preview_path(name) {
+            let key = format!("pet:{name}");
+            if !g.has_image(&key) {
+                if let Some((rgba, iw, ih)) =
+                    crate::sprites::user_asset_rgba_in(path.parent().unwrap_or(&path), "preview.png")
+                {
+                    g.upload_image(&key, &rgba, iw, ih);
+                }
+            }
+            if g.has_image(&key) {
+                g.queue_image_above(&key, rect.0 + 8.0, rect.1 + 6.0, CARD_W - 16.0, CARD_H - 34.0);
+            }
+        }
+        let shown = fit(g, name, CARD_W - 12.0, 11.0, selected);
+        let tw = g.measure_chrome_text(&shown, 11.0, selected);
+        draw_text(
+            g,
+            rect.0 + (CARD_W - tw) / 2.0,
+            rect.1 + CARD_H - 22.0,
+            &shown,
+            11.0,
+            if selected { theme::text() } else { theme::text_dim() },
+            selected,
+        );
+    }
+    let rows = names.len().div_ceil(per_row) as f32;
+    *y += rows * (CARD_H + gap) + 8.0;
+}
+
+fn paint_machines(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    let rows = machines_view();
+    draw_text(
+        g,
+        x,
+        *y,
+        "터미널에서 `to <이름>` 으로 오갑니다 — `to` 만 치면 목록이 나옵니다",
+        11.0,
+        theme::text_dim(),
+        false,
+    );
+    *y += 30.0;
+    // 카사크롬(브라우저 도구)이 어느 기계의 크롬을 조작할지 — 이 기계가 기본이고,
+    // 명부에 ssh 나 chrome_port 가 있는 기계만 고를 수 있다(다리로 갈 길이 있어야 한다).
+    // 고른 기계가 안 닿으면 MCP 는 이 기계 크롬으로 물러난다(하단바 「모바일」 칩이 말한다).
+    draw_text(g, x, *y + 5.0, "카사크롬이 쓰는 크롬", 12.5, theme::text(), true);
+    *y += 28.0;
+    {
+        let chosen = kasa_mcp::machines::kasachrome_machine();
+        let candidates = kasa_mcp::machines::kasachrome_candidates();
+        let mut cells: Vec<(&str, bool, SettingsAction)> = vec![(
+            "이 기계",
+            chosen.is_empty(),
+            SettingsAction::ChromeMachine(String::new()),
+        )];
+        for label in &candidates {
+            cells.push((
+                label.as_str(),
+                chosen == *label,
+                SettingsAction::ChromeMachine(label.clone()),
+            ));
+        }
+        seg_row(g, s, hits, x, y, w, "크롬 기계", &cells);
+        *y += 6.0;
+        let note = if chosen.is_empty() {
+            "학생의 브라우저 도구가 이 맥의 크롬을 씁니다".to_string()
+        } else {
+            format!("학생의 브라우저 도구가 {chosen} 의 크롬(로그인 그대로)을 쓰고, 안 닿으면 이 맥 크롬으로 물러납니다")
+        };
+        for line in wrap_words(g, &note, w, 10.5) {
+            draw_text(g, x, *y, &line, 10.5, theme::text_mute(), false);
+            *y += 15.0;
+        }
+        *y += 11.0;
+    }
+    draw_text(g, x, *y + 5.0, "명부", 12.5, theme::text(), true);
+    button(
+        g,
+        s,
+        hits,
+        (x + w - 104.0, *y, 104.0, 30.0),
+        "＋ 기계 추가",
+        Target::Setting(SettingsAction::AddMachine),
+        false,
+    );
+    // 버튼(30px) 아래로 내려서 시작하고, 폭에 맞춰 접는다 — 한 줄로 두면 버튼
+    // 밑을 지나 오른쪽 경계 너머까지 흘렀다(2026-09-07 지적 「박스 마감」).
+    *y += 34.0;
+    let guide = crate::native_strings::text(
+        "이름과 ssh 대상(user@host)만 적으면 됩니다 — 열쇠는 ~/.ssh 에서 찾아 짝짓고, 다른 망의 기계는 넷버드(VPN)로 먼저 이어 두세요",
+    );
+    for line in wrap_words(g, &guide, w, 10.5) {
+        draw_text(g, x, *y, &line, 10.5, theme::text_mute(), false);
+        *y += 16.0;
+    }
+    *y += 6.0;
+    if rows.is_empty() {
+        draw_text(
+            g,
+            x,
+            *y,
+            "아직 등록된 기계가 없어요 — 위 「기계 추가」로 하나 넣어 주세요",
+            11.0,
+            theme::text_mute(),
+            false,
+        );
+        *y += 24.0;
+    }
+    for (i, m) in rows.iter().enumerate() {
+        machine_row(g, s, hits, caret, x, y, w, i, m);
+    }
+    if rows.iter().any(|machine| machine.online && !machine.build_match) {
+        draw_text(
+            g,
+            x + 2.0,
+            *y,
+            "새 판 보내기: 이 맥에서 다시 굽고, 고른 기기의 앱만 교체해 되띄웁니다",
+            10.5,
+            theme::text_mute(),
+            false,
+        );
+        *y += 20.0;
+    }
+    *y += 8.0;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn machine_row(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    idx: usize,
+    m: &MachineRow,
+) {
+    let editing = s.machine_edit.as_ref().filter(|(i, _, _)| *i == idx);
+    let syncable = m.online && !m.build_match && !m.guest && !m.sync_target.is_empty();
+    // 고치는 중엔 줄이 자란다 — 라벨(18)+입력칸(36)이 54px 줄을 넘쳐 상자 밖으로
+    // 삐져나왔다(2026-09-07 지적). 아래 안내 한 줄까지 담는다.
+    // 빌드가 다른 줄도 수리 버튼을 별도 행에 둔다. 이름·상태·수정·삭제와 한 줄에
+    // 몰면 가장 중요한 경고와 복구 버튼이 서로 잘린다.
+    let rect = (
+        x,
+        *y,
+        w,
+        if editing.is_some() {
+            96.0
+        } else if syncable {
+            90.0
+        } else {
+            54.0
+        },
+    );
+    stroke_round(
+        g,
+        rect,
+        theme::radius_md(),
+        if contains(rect, s.cursor) {
+            theme::text_dim()
+        } else {
+            theme::border()
+        },
+    );
+    g.queue_icon(
+        "server",
+        rect.0 + 12.0,
+        rect.1 + 18.0,
+        17.0,
+        if m.online {
+            theme::accent()
+        } else {
+            theme::text_mute()
+        },
+    );
+
+    let w_del = g.measure_chrome_text("삭제", 10.5, false) + 32.0;
+    let text_x = rect.0 + 40.0;
+    let field_w = ((rect.2 - w_del - 28.0 - (text_x - rect.0)) / 2.0 - 8.0).max(110.0);
+    match editing {
+        // 고치는 중에는 두 칸을 나란히 — 이름만 고치고 ssh 를 못 고치면 결국
+        // 파일을 열게 된다.
+        Some((_, ssh_field, value)) => {
+            text_field(
+                g,
+                s,
+                hits,
+                caret,
+                text_x,
+                rect.1 + 12.0,
+                field_w,
+                "이름",
+                if *ssh_field { &m.label } else { value },
+                SettingsInput::MachineField,
+                s.settings_caret,
+                false,
+            );
+            text_field(
+                g,
+                s,
+                hits,
+                caret,
+                text_x + field_w + 12.0,
+                rect.1 + 12.0,
+                field_w,
+                "ssh 대상 — user@host 또는 ~/.ssh/config 별칭",
+                if *ssh_field { value } else { &m.ssh },
+                SettingsInput::MachineField,
+                s.settings_caret,
+                false,
+            );
+            draw_text(
+                g,
+                text_x + 2.0,
+                rect.1 + 72.0,
+                "Enter 저장 · Esc 취소 · 열쇠 로그인만 받는 기계는 별칭에 열쇠를 짝지어 두세요",
+                10.5,
+                theme::text_dim(),
+                false,
+            );
+        }
+        None => {
+            let actions_w = w_del + 36.0;
+            let avail = rect.2 - actions_w - 12.0 - (text_x - rect.0);
+            let status_w = g.measure_chrome_text(&m.status, 10.5, false) + 22.0;
+            let name = fit(g, &m.label, (avail - status_w - 8.0).max(28.0), 12.0, true);
+            draw_text(g, text_x, rect.1 + 8.0, &name, 12.0, theme::text(), true);
+            let nw = g.measure_chrome_text(&name, 12.0, true);
+            pill(g, text_x + nw + 8.0, rect.1 + 7.0, &m.status, m.online);
+            let ssh = if m.ssh.is_empty() {
+                "ssh 대상이 비어 있어요".to_string()
+            } else if m.key.is_empty() {
+                fit(g, &m.ssh, avail, 10.5, false)
+            } else {
+                fit(g, &format!("{}  ·  열쇠 {}", m.ssh, m.key), avail, 10.5, false)
+            };
+            draw_text(
+                g,
+                text_x,
+                rect.1 + 29.0,
+                &ssh,
+                10.5,
+                if m.ssh.is_empty() {
+                    theme::danger()
+                } else {
+                    theme::text_mute()
+                },
+                false,
+            );
+            // 알려 온 기계는 고칠 칸도 지울 항목도 없다 — 저쪽이 알림을 끊으면 빠진다.
+            if m.guest {
+                *y += rect.3 + 6.0;
+                return;
+            }
+            // 줄 아무 데나 누르면 이름 칸부터 고친다 — 연필을 따로 찾지 않아도 된다.
+            register_clipped(
+                g,
+                hits,
+                Target::Setting(SettingsAction::FocusMachineField(idx, false)),
+                (rect.0, rect.1, rect.2 - actions_w - 8.0, rect.3),
+                HitCursor::Pointer,
+            );
+            let pencil_x = rect.0 + rect.2 - w_del - 36.0;
+            mini_icon_button(
+                g,
+                s,
+                hits,
+                (pencil_x, rect.1 + 14.0, 26.0, 26.0),
+                "pencil",
+                Target::Setting(SettingsAction::FocusMachineField(idx, true)),
+            );
+            if syncable {
+                mini_text_button(
+                    g,
+                    s,
+                    hits,
+                    text_x,
+                    rect.1 + 55.0,
+                    "rotate-cw",
+                    "새 판 보내기",
+                    Target::Setting(SettingsAction::SyncMachine(
+                        m.label.clone(),
+                        m.sync_target.clone(),
+                    )),
+                    true,
+                );
+            }
+            mini_text_button(
+                g,
+                s,
+                hits,
+                rect.0 + rect.2 - 8.0 - w_del,
+                rect.1 + 14.0,
+                "trash-2",
+                "삭제",
+                Target::Setting(SettingsAction::RemoveMachine(idx)),
+                true,
+            );
+        }
+    }
+    *y += rect.3 + 6.0;
+}
+
+fn paint_themes(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "캐릭터 테마",
+        "명단과 그림, 성격을 한 벌로 갈아낍니다",
+    );
+    *y += 54.0;
+    let gap = 12.0;
+    let cols = if w >= 620.0 { 2 } else { 1 };
+    let cw = (w - gap * (cols - 1) as f32) / cols as f32;
+    let ch = 112.0;
+    for (i, theme_row) in s.themes.iter().enumerate() {
+        let rect = (
+            x + (i % cols) as f32 * (cw + gap),
+            *y + (i / cols) as f32 * (ch + gap),
+            cw,
+            ch,
+        );
+        choice_card(
+            g,
+            s,
+            hits,
+            rect,
+            s.character_theme == theme_row.id,
+            Target::Setting(SettingsAction::SelectTheme(theme_row.id.clone())),
+        );
+        let label = fit(g, &theme_row.label, rect.2 - 32.0, 14.0, true);
+        draw_text(
+            g,
+            rect.0 + 16.0,
+            rect.1 + 15.0,
+            &label,
+            14.0,
+            theme::text(),
+            true,
+        );
+        draw_text(
+            g,
+            rect.0 + 16.0,
+            rect.1 + 42.0,
+            &format!("캐릭터 {}명", theme_row.count),
+            11.0,
+            theme::text_dim(),
+            false,
+        );
+        // 얼굴은 카드 폭이 허락하는 만큼. 오른쪽 아래 단추 세 개(또는 「기본」 알약)가
+        // 서는 자리까지만 밀고 들어간다 — 고정 개수로 두면 넓은 카드 가운데가 빈다.
+        let face_room = (rect.2 - 106.0 - 12.0).max(0.0);
+        let face_fit = ((face_room / 34.0).floor() as usize).clamp(1, theme_row.faces.len());
+        for (j, (slug, _)) in theme_row.faces.iter().take(face_fit).enumerate() {
+            let face = (
+                rect.0 + 12.0 + j as f32 * 34.0,
+                rect.1 + 60.0,
+                30.0,
+                38.0,
+            );
+            let status = s.media.draw_face(g, &theme_row.id, slug, face);
+            if !status.is_ready() {
+                round_rect(g, face.0, face.1 + 7.0, 24.0, 24.0, 12.0, color_for_word(slug));
+            }
+        }
+        let inspect = (rect.0 + rect.2 - 38.0, rect.1 + 8.0, 26.0, 26.0);
+        mini_icon_button(
+            g,
+            s,
+            hits,
+            inspect,
+            "users",
+            Target::Setting(SettingsAction::InspectTheme(theme_row.id.clone())),
+        );
+        if !theme_row.id.is_empty() {
+            let rename = (rect.0 + rect.2 - 106.0, rect.1 + 68.0, 26.0, 26.0);
+            let open = (rect.0 + rect.2 - 72.0, rect.1 + 68.0, 26.0, 26.0);
+            let delete = (rect.0 + rect.2 - 38.0, rect.1 + 68.0, 26.0, 26.0);
+            mini_icon_button(
+                g,
+                s,
+                hits,
+                rename,
+                "edit-3",
+                Target::Setting(SettingsAction::FocusThemeLabel(theme_row.id.clone())),
+            );
+            mini_icon_button(
+                g,
+                s,
+                hits,
+                open,
+                "folder-open",
+                Target::Setting(SettingsAction::OpenThemeDir(theme_row.id.clone())),
+            );
+            mini_icon_button(
+                g,
+                s,
+                hits,
+                delete,
+                "x",
+                Target::Setting(SettingsAction::DeleteTheme(theme_row.id.clone())),
+            );
+        } else {
+            // 번들 테마는 폴더가 없어 이름 바꾸기·열기·지우기가 **없는 동작**이다.
+            // 그렇다고 그 자리를 비워 두면 카드마다 오른쪽 아래가 있다 없다 해서
+            // 줄이 어긋나 보인다(2026-09-22 판독). 왜 없는지를 같은 자리에 적는다 —
+            // 못 쓰는 단추를 세우는 것보다 정직하고, 줄도 선다.
+            let text = "기본";
+            let pw = g.measure_chrome_text(text, 9.5, false) + 14.0;
+            pill(g, rect.0 + rect.2 - 12.0 - pw, rect.1 + 72.5, text, false);
+        }
+    }
+    let rows = (s.themes.len() + cols - 1) / cols;
+    *y += rows as f32 * (ch + gap) + 6.0;
+    if let Some((id, label)) = s.theme_label_edit.as_ref() {
+        text_field(
+            g,
+            s,
+            hits,
+            caret,
+            x,
+            *y,
+            w,
+            &format!("{} 이름", id),
+            label,
+            SettingsInput::ThemeLabel,
+            s.settings_caret,
+            false,
+        );
+        *y += 62.0;
+    }
+    if let Some(id) = s.inspected_theme.as_deref() {
+        let key = if id.is_empty() {
+            kasa_mcp::character::BASE_THEME_KEY
+        } else {
+            id
+        };
+        let roster = s.theme_rosters.get(key).cloned().unwrap_or_default();
+        let label = s
+            .themes
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.label.as_str())
+            .unwrap_or(key);
+        section_title(
+            g,
+            x,
+            *y,
+            &format!("{label} 명단"),
+            "다른 명단과 함께 사용할 캐릭터를 고릅니다",
+        );
+        *y += 54.0;
+        button(
+            g,
+            s,
+            hits,
+            (x, *y, 112.0, 34.0),
+            "전부 고르기",
+            Target::Setting(SettingsAction::ThemePickAll(key.to_string(), true)),
+            false,
+        );
+        button(
+            g,
+            s,
+            hits,
+            (x + 120.0, *y, 124.0, 34.0),
+            "선택 해제",
+            Target::Setting(SettingsAction::ThemePickAll(key.to_string(), false)),
+            false,
+        );
+        *y += 46.0;
+        let cols = if w >= 680.0 { 7 } else if w >= 470.0 { 5 } else { 3 };
+        let gap = 7.0;
+        let card_w = (w - gap * (cols - 1) as f32) / cols as f32;
+        let card_h = 82.0;
+        for (index, character) in roster.iter().enumerate() {
+            let on = character_choice_selected(s, key, &character.name);
+            let rect = (
+                x + (index % cols) as f32 * (card_w + gap),
+                *y + (index / cols) as f32 * (card_h + gap),
+                card_w,
+                card_h,
+            );
+            choice_card(
+                g,
+                s,
+                hits,
+                rect,
+                on,
+                Target::Setting(SettingsAction::CharacterPick(
+                    key.to_string(),
+                    character.name.clone(),
+                    !on,
+                )),
+            );
+            s.media.draw_face(
+                g,
+                id,
+                &character.slug,
+                (rect.0 + 8.0, rect.1 + 4.0, rect.2 - 16.0, 55.0),
+            );
+            let name = fit(g, &character.name, rect.2 - 12.0, 10.5, on);
+            draw_text(
+                g,
+                rect.0 + 6.0,
+                rect.1 + 64.0,
+                &name,
+                10.5,
+                if on { theme::text() } else { theme::text_mute() },
+                on,
+            );
+        }
+        let rows = (roster.len() + cols - 1) / cols;
+        *y += rows as f32 * (card_h + gap);
+        *y += 10.0;
+    }
+    button(
+        g,
+        s,
+        hits,
+        (x, *y, 126.0, 34.0),
+        "현재 테마 복제",
+        Target::Setting(SettingsAction::ExportTheme),
+        true,
+    );
+    button(
+        g,
+        s,
+        hits,
+        (x + 136.0, *y, 108.0, 34.0),
+        "목록 새로고침",
+        Target::Setting(SettingsAction::RefreshStudentAssets),
+        false,
+    );
+    *y += 50.0;
+    info_slab(
+        g,
+        x,
+        y,
+        w,
+        "ZIP 테마 파일은 이 설정 방 어디에든 놓아 가져올 수 있어요.",
+    );
+}
+
+// 선택과 편집은 서로 다른 동작이므로 카드와 편집 버튼의 대상을 나눈다.
+fn paint_character_theme_row(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(g, x, *y, "사용할 캐릭터", "앱 테마와 관계없이 여러 명단에서 함께 고릅니다");
+    *y += 54.0;
+    info_slab(g, x, y, w, "새 대화에 사용할 명단이에요. 앱 테마와 따로 고르고, 같은 이름·그림은 새 선택으로 교체해요.");
+    let fallback = !s.ordered_picks.iter().any(|(key, names)| s.theme_rosters.get(key)
+        .is_some_and(|roster| roster.iter().any(|character| names.contains(&character.name))));
+    if fallback {
+        info_slab(g, x, y, w, "선택한 캐릭터가 없으면 기본 명단을 사용해요.");
+    }
+    for row in s.themes.iter() {
+        let key = if row.id.is_empty() { kasa_mcp::character::BASE_THEME_KEY } else { &row.id };
+        let Some(roster) = s.theme_rosters.get(key) else { continue };
+        if roster.is_empty() { continue; }
+        let label = fit(g, &row.label, w.max(0.0), 14.0, true);
+        draw_text(g, x, *y, &label, 14.0, theme::text(), true);
+        *y += 30.0;
+        let gap = 8.0;
+        let cols = ((w + gap) / 170.0).floor().max(1.0) as usize;
+        let cw = (w - gap * (cols - 1) as f32) / cols as f32;
+        for (i, character) in roster.iter().enumerate() {
+            let on = character_choice_selected(s, key, &character.name);
+            let rect = (x + (i % cols) as f32 * (cw + gap), *y + (i / cols) as f32 * 82.0, cw, 74.0);
+            choice_card(g, s, hits, rect, on, Target::Setting(SettingsAction::CharacterPick(key.to_string(), character.name.clone(), !on)));
+            s.media.draw_face(g, &row.id, &character.slug, (rect.0 + 6.0, rect.1 + 8.0, 40.0, 54.0));
+            let name = fit(g, &character.name, (cw - 88.0).max(0.0), 12.0, on);
+            draw_text(g, rect.0 + 50.0, rect.1 + 17.0, &name, 12.0, theme::text(), on);
+            draw_text(g, rect.0 + 50.0, rect.1 + 40.0, if on { "사용 중" } else { "선택" }, 10.5, theme::text_dim(), false);
+            mini_icon_button(g, s, hits, (rect.0 + cw - 32.0, rect.1 + 24.0, 26.0, 26.0), "edit-3", Target::Setting(SettingsAction::SelectStudentInTheme(row.id.clone(), character.name.clone())));
+        }
+        *y += ((roster.len() + cols - 1) / cols) as f32 * 82.0 + 24.0;
+    }
+    button(
+        g,
+        s,
+        hits,
+        (x, *y, 92.0, CTL_H),
+        "테마 관리",
+        Target::Category(SettingsCat::Theme),
+        false,
+    );
+    let description = fit(g, "명단과 그림, 내보내기·삭제", (w - 104.0).max(0.0), 11.5, false);
+    draw_text(
+        g,
+        x + 104.0,
+        *y + 6.5,
+        &description,
+        11.5,
+        theme::text_dim(),
+        false,
+    );
+    *y += CTL_H + 28.0;
+}
+
+fn character_choice_selected(s: &Snapshot, key: &str, name: &str) -> bool {
+    character_choice_selected_from(&s.ordered_picks, &s.theme_rosters, &s.character_theme, key, name)
+}
+
+fn character_choice_selected_from(
+    selected: &[(String, Vec<String>)],
+    rosters: &std::collections::HashMap<String, Vec<CharacterChoice>>,
+    active: &str,
+    key: &str,
+    name: &str,
+) -> bool {
+    let picks: Vec<_> = selected.iter().filter(|(key, names)| rosters.get(key).is_some_and(|roster| roster.iter().any(|c| names.contains(&c.name)))).collect();
+    if picks.is_empty() {
+        return key == if active.is_empty() { kasa_mcp::character::BASE_THEME_KEY } else { active };
+    }
+    // 저장 순서가 실제 배정 우선순위이므로 과거 중복 선택도 그대로 표시한다.
+    picks.iter().find(|(theme, names)| names.iter().any(|n| n == name)
+        && rosters.get(theme).is_some_and(|roster| roster.iter().any(|c| c.name == name)))
+        .is_some_and(|(theme, _)| theme.as_str() == key)
+}
+
+fn paint_students(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    if s.student_selected.is_none() {
+        paint_character_theme_row(g, s, hits, x, y, w);
+        return;
+    }
+    paint_themegen_engine(g, s, hits, caret, x, y, w);
+    if let Some(selected) = s.student_selected.as_deref() {
+        button(
+            g,
+            s,
+            hits,
+            (x, *y, 98.0, 32.0),
+            "목록으로",
+            Target::Setting(SettingsAction::CloseStudent),
+            false,
+        );
+        let selected_label = fit(g, selected, (w - 194.0).max(0.0), 17.0, true);
+        draw_text(g, x + 112.0, *y + 6.0, &selected_label, 17.0, theme::text(), true);
+        let selected_theme = fit(g, if s.student_theme.is_empty() { "Bundled" } else { &s.student_theme }, (w - 194.0).max(0.0), 10.5, false);
+        draw_text(
+            g,
+            x + 112.0,
+            *y + 28.0,
+            &selected_theme,
+            10.5,
+            theme::text_dim(),
+            false,
+        );
+        if !s.student_slug.is_empty() {
+            let face = (x + w - 72.0, *y - 8.0, 64.0, 76.0);
+            let status = s
+                .media
+                .draw_face(g, &s.student_theme, &s.student_slug, face);
+            if !status.is_ready() {
+                round_rect(
+                    g,
+                    face.0 + 10.0,
+                    face.1 + 16.0,
+                    42.0,
+                    42.0,
+                    21.0,
+                    color_for_word(&s.student_slug),
+                );
+            }
+        }
+        *y += 48.0;
+        segmented(
+            g,
+            s,
+            hits,
+            x,
+            *y,
+            w.min(280.0),
+            &[
+                (
+                    "화면으로",
+                    !s.student_raw_open,
+                    SettingsAction::ToggleStudentRaw(false),
+                ),
+                (
+                    "원본",
+                    s.student_raw_open,
+                    SettingsAction::ToggleStudentRaw(true),
+                ),
+            ],
+        );
+        *y += 46.0;
+        if s.student_raw_open {
+            segmented(
+                g,
+                s,
+                hits,
+                x,
+                *y,
+                230.0,
+                &[
+                    ("JSON", !s.student_raw_yaml, SettingsAction::StudentRawFormat(false)),
+                    ("YAML", s.student_raw_yaml, SettingsAction::StudentRawFormat(true)),
+                ],
+            );
+            button(
+                g,
+                s,
+                hits,
+                (x + 242.0, *y, 104.0, 34.0),
+                "원본 저장",
+                Target::Setting(SettingsAction::SaveStudentRaw),
+                true,
+            );
+            *y += 46.0;
+            text_field(
+                g,
+                s,
+                hits,
+                caret,
+                x,
+                *y,
+                w,
+                "정의 전체",
+                &s.student_raw_text,
+                SettingsInput::StudentRaw,
+                s.student_raw_caret,
+                true,
+            );
+            *y += 158.0;
+            if let Some(error) = s.student_raw_error.as_deref() {
+                info_slab(g, x, y, w, error);
+            }
+            return;
+        }
+        text_field(
+            g,
+            s,
+            hits,
+            caret,
+            x,
+            *y,
+            w,
+            "이름",
+            &s.student_name,
+            SettingsInput::StudentName,
+            s.settings_caret,
+            false,
+        );
+        *y += 60.0;
+        section_title(
+            g,
+            x,
+            *y,
+            "모델",
+            "이 캐릭터만 다른 실행 통로를 쓸 수 있습니다",
+        );
+        *y += 52.0;
+        let choices: Vec<(String, bool, SettingsAction)> = s
+            .models
+            .iter()
+            .map(|choice| {
+                let selected =
+                    s.student_model == choice.model && s.student_backend == choice.backend;
+                (
+                    choice.label.clone(),
+                    selected,
+                    SettingsAction::StudentModel(choice.model.clone(), choice.backend.clone()),
+                )
+            })
+            .collect();
+        chips_owned(g, s, hits, x, y, w, choices);
+        section_title(
+            g,
+            x,
+            *y,
+            "성격",
+            "다른 칸으로 나가거나 목록으로 돌아갈 때 저장합니다",
+        );
+        *y += 50.0;
+        text_field(
+            g,
+            s,
+            hits,
+            caret,
+            x,
+            *y,
+            w,
+            "",
+            &s.student_persona,
+            SettingsInput::StudentPersona,
+            s.student_caret,
+            true,
+        );
+        *y += 154.0;
+        section_title(
+            g,
+            x,
+            *y,
+            "그림 생성",
+            "참조 그림을 이 화면에 놓고 모든 기본 동작을 한 번에 굽습니다",
+        );
+        *y += 54.0;
+        let status = match s.themegen_phase {
+            Some(crate::themegen::GenPhase::Describing) => "그림 살펴보는 중",
+            Some(crate::themegen::GenPhase::Generating) => "굽는 중",
+            Some(crate::themegen::GenPhase::Installing) => "설치하는 중",
+            Some(crate::themegen::GenPhase::Done) => "완성",
+            Some(crate::themegen::GenPhase::Failed) => "실패",
+            None if s.themegen_has_ref => "참조 그림 준비됨",
+            None => "참조 그림을 놓아 주세요",
+        };
+        let reference_rect = (x, *y, 72.0, 72.0);
+        let reference_status = s.media.draw_reference(
+            g,
+            &s.student_theme,
+            &s.student_slug,
+            reference_rect,
+        );
+        draw_text(
+            g,
+            x + 84.0,
+            *y + 9.0,
+            status,
+            12.0,
+            theme::text_dim(),
+            false,
+        );
+        draw_text(
+            g,
+            x + 84.0,
+            *y + 31.0,
+            reference_status.label(),
+            10.5,
+            theme::text_mute(),
+            false,
+        );
+        if s.themegen_has_ref
+            && !matches!(
+                s.themegen_phase,
+                Some(crate::themegen::GenPhase::Describing)
+                    | Some(crate::themegen::GenPhase::Generating)
+                    | Some(crate::themegen::GenPhase::Installing)
+            )
+        {
+            button(
+                g,
+                s,
+                hits,
+                (x + w - 112.0, *y + 38.0, 112.0, 34.0),
+                "그림 굽기",
+                Target::Setting(SettingsAction::ThemeGenStart),
+                true,
+            );
+        }
+        *y += 84.0;
+        paint_motion_sprites(g, s, hits, x, y, w);
+        button(
+            g,
+            s,
+            hits,
+            (x, *y, 132.0, 34.0),
+            "캐릭터 폴더 열기",
+            Target::Setting(SettingsAction::OpenStudentsDir),
+            false,
+        );
+        button(
+            g,
+            s,
+            hits,
+            (x + 142.0, *y, 132.0, 34.0),
+            "정의 파일 열기",
+            Target::Setting(SettingsAction::OpenCharactersJson),
+            false,
+        );
+        button(
+            g,
+            s,
+            hits,
+            (x + 284.0, *y, 116.0, 34.0),
+            "그림 새로고침",
+            Target::Setting(SettingsAction::RefreshStudentAssets),
+            false,
+        );
+        *y += 50.0;
+        info_slab(g, x, y, w, "그림 파일을 이 화면에 놓으면 이 캐릭터의 참조로 저장합니다.");
+        return;
+    }
+}
+
+fn paint_motion_sprites(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "모션 그림",
+        "프레임 칸을 고르고 그림 파일을 놓으면 그 한 장만 바뀝니다",
+    );
+    *y += 54.0;
+    for (motion, title) in [
+        ("idle", "대기"),
+        ("walk", "걷기"),
+        ("wave", "손 흔들기"),
+        ("cheer", "완료"),
+        ("profile", "프로필"),
+        ("gif", "대기 GIF"),
+    ] {
+        let Some((count, ext)) = socket::character_sprite_spec(motion) else { continue };
+        let media_status = s
+            .media
+            .motion_status(&s.student_theme, &s.student_slug, motion);
+        draw_text(g, x + 2.0, *y + 9.0, title, 12.0, theme::text(), true);
+        draw_text(
+            g,
+            x + 92.0,
+            *y + 9.0,
+            &format!("{} × {} · {}", ext.to_uppercase(), count, media_status.label()),
+            10.5,
+            theme::text_dim(),
+            false,
+        );
+        let preview = (x, *y + 25.0, 54.0, 46.0);
+        if g.clip_hit(preview).is_some() && matches!(media_status, crate::settings_media::MediaStatus::Ready { frames, .. } if frames > 1) {
+            mark_motion_preview_visible();
+        }
+        s.media.draw_motion_preview(
+            g,
+            &s.student_theme,
+            &s.student_slug,
+            motion,
+            s.media_elapsed,
+            preview,
+        );
+        let mut bx = x + 64.0;
+        for frame in 0..count {
+            let selected = s
+                .sprite_slot
+                .as_ref()
+                .is_some_and(|(picked_motion, picked_frame)| picked_motion == motion && *picked_frame == frame);
+            let rect = (bx, *y + 31.0, 34.0, 34.0);
+            choice_card(
+                g,
+                s,
+                hits,
+                rect,
+                selected,
+                Target::Setting(SettingsAction::SelectMotionFrame(motion.to_string(), frame)),
+            );
+            s.media.draw_motion_frame(
+                g,
+                &s.student_theme,
+                &s.student_slug,
+                motion,
+                frame,
+                (rect.0 + 2.0, rect.1 + 2.0, rect.2 - 4.0, rect.3 - 4.0),
+            );
+            draw_text(
+                g,
+                rect.0 + rect.2 - 10.0,
+                rect.1 + rect.3 - 13.0,
+                &(frame + 1).to_string(),
+                11.0,
+                theme::text(),
+                selected,
+            );
+            bx += 40.0;
+        }
+        button(
+            g,
+            s,
+            hits,
+            (x + w - 88.0, *y, 88.0, 32.0),
+            "기본으로",
+            Target::Setting(SettingsAction::ResetMotion(motion.to_string())),
+            false,
+        );
+        *y += 78.0;
+    }
+    *y += 12.0;
+}
+
+fn paint_themegen_engine(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "그림 생성 엔진",
+        "준비되지 않은 엔진은 이유를 함께 표시합니다",
+    );
+    *y += 54.0;
+    let providers = s
+        .themegen_providers
+        .iter()
+        .map(|provider| {
+            (
+                if provider.available {
+                    provider.label.clone()
+                } else {
+                    format!("{} · 준비 안 됨", provider.label)
+                },
+                provider.kind == s.themegen_provider,
+                SettingsAction::ThemeGenProvider(provider.kind.to_string()),
+            )
+        })
+        .collect();
+    chips_owned(g, s, hits, x, y, w, providers);
+    if let Some(provider) = s
+        .themegen_providers
+        .iter()
+        .find(|provider| provider.kind == s.themegen_provider && !provider.available)
+    {
+        info_slab(g, x, y, w, &provider.why);
+    }
+    if s.themegen_provider == "nanobanana" {
+        let value = if s.input == Some(SettingsInput::ThemeGenKey) {
+            s.themegen_key_edit.as_str()
+        } else {
+            s.themegen_key_masked.as_str()
+        };
+        text_field(
+            g,
+            s,
+            hits,
+            caret,
+            x,
+            *y,
+            w.min(420.0),
+            "Gemini API 키",
+            value,
+            SettingsInput::ThemeGenKey,
+            s.settings_caret,
+            false,
+        );
+        *y += 64.0;
+    }
+    *y += 12.0;
+}
+
+fn paint_feedback(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+) {
+    section_title(
+        g,
+        x,
+        *y,
+        "무엇이 불편했나요",
+        "보내지 않고 이 기기의 피드백 폴더에 한 장씩 저장합니다",
+    );
+    *y += 56.0;
+    text_field(
+        g,
+        s,
+        hits,
+        caret,
+        x,
+        *y,
+        w,
+        "",
+        &s.feedback_body,
+        SettingsInput::FeedbackBody,
+        s.feedback_caret,
+        true,
+    );
+    *y += 158.0;
+    toggle_row(
+        g,
+        s,
+        hits,
+        x,
+        y,
+        w,
+        "진단 정보 함께 남기기",
+        s.feedback_diag,
+        SettingsAction::ToggleFeedbackDiag,
+    );
+    info_slab(g, x, y, w, &s.feedback_diag_line);
+    button(
+        g,
+        s,
+        hits,
+        (x, *y, 106.0, 36.0),
+        "피드백 저장",
+        Target::Setting(SettingsAction::SaveFeedback),
+        true,
+    );
+    button(
+        g,
+        s,
+        hits,
+        (x + 118.0, *y, 116.0, 36.0),
+        "저장 폴더 열기",
+        Target::Setting(SettingsAction::OpenFeedbackDir),
+        false,
+    );
+    *y += 52.0;
+}
+
+/// 본진 계정 칸을 화면이 쓰는 모양으로 바꾼다. 폴링도 여기서 태운다 — 계정
+/// 화면이 떠 있는 동안만 물어보면 되고, 그 밖에서는 한 번도 안 나간다.
+fn home_accounts_view() -> Option<HomeAccountsView> {
+    crate::homeaccounts::poll();
+    let (label, value, error) = crate::homeaccounts::snapshot()?;
+    let value = value.unwrap_or_default();
+    let rows: Vec<AccountChoice> = value
+        .accounts
+        .iter()
+        .filter_map(|v| {
+            let id = v.get("id")?.as_str()?.to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let windows: Vec<crate::UsageWindowBadge> = v
+                .get("usage_windows")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|window| {
+                    Some(crate::UsageWindowBadge {
+                        label: window.get("label")?.as_str()?.to_string(),
+                        pct: window.get("pct")?.as_f64()? as f32,
+                        resets_at: window
+                            .get("resets_at")
+                            .and_then(serde_json::Value::as_u64),
+                    })
+                })
+                .collect();
+            let usage_windows = windows.clone();
+            let usage = v.get("usage").and_then(serde_json::Value::as_f64).map(|pct| {
+                crate::UsageBadge {
+                    pct: pct as f32,
+                    label: v
+                        .get("usage_label")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    stale: v
+                        .get("usage_stale")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    account_dir: id.clone(),
+                    resets_at: v
+                        .get("usage_resets_at")
+                        .and_then(serde_json::Value::as_u64),
+                    windows,
+                }
+            });
+            let usage_state = match v
+                .get("usage_state")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("logged_out") => AccountUsageState::LoggedOut,
+                _ if usage.as_ref().is_some_and(|badge| badge.stale) => AccountUsageState::Failed,
+                Some("failed") => AccountUsageState::Failed,
+                Some("loading") => AccountUsageState::Loading,
+                Some("ready") => AccountUsageState::Ready,
+                _ if usage.is_some() => AccountUsageState::Ready,
+                _ => AccountUsageState::Loading,
+            };
+            Some(AccountChoice {
+                // 본진이 보낸 부제가 곧 그 계정의 신원이다 — 주소 꼴일 때만
+                // 도메인 표가 선다.
+                email: v
+                    .get("sub")
+                    .and_then(|x| x.as_str())
+                    .filter(|t| t.contains('@'))
+                    .unwrap_or("")
+                    .to_string(),
+                provider: AccountProvider::Claude,
+                active: id == value.active,
+                name: v.get("name").and_then(|x| x.as_str()).unwrap_or(&id).to_string(),
+                sub: v.get("sub").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                sub_kind: match v.get("sub_kind").and_then(|x| x.as_str()) {
+                    Some("danger") => "danger",
+                    Some("faint") => "faint",
+                    _ => "mute",
+                },
+                slot: true,
+                id,
+                usage,
+                usage_windows,
+                usage_state,
+            })
+        })
+        .collect();
+    Some(HomeAccountsView {
+        label,
+        accounts: Arc::new(rows),
+        autoswitch: value.autoswitch,
+        autoswitch_pct: value.autoswitch_pct,
+        login: value.login,
+        error,
+    })
+}
+
+fn account_group(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    provider: AccountProvider,
+) {
+    // Claude 계정은 **학생이 실제로 사는 기계**의 것을 다룬다. 본진이 켜져 있으면
+    // 등록도 전환도 거기서 일어나야 하고, 이 기계에 등록해 봐야 한 도가 차는 곳과
+    // 달라 아무 일도 안 난다(2026-09-05). codex 는 아직 로컬 그대로다.
+    let home = s
+        .home_accounts
+        .as_ref()
+        .filter(|_| provider == AccountProvider::Claude && s.account_scope_home);
+    // 진행 상태는 두 곳에서 온다 — 로컬은 프로세스 셀, 본진은 그 기계가 실어
+    // 보낸 문자열. 화면은 같은 모양으로 그린다. 머리에서 미리 재는 것은 로그인이
+    // 도는 동안 「계정 추가」를 감추기 위해서다 — 시작 단추와 진행 안내가 한
+    // 화면에 함께 서면 어느 쪽이 지금인지 읽히지 않는다.
+    let local_state = s.login_job.as_ref().map(|job| &job.state);
+    let needs_code = match home {
+        Some(h) => h.login.as_ref().is_some_and(|(_, st, _)| st == "need_code"),
+        None => local_state == Some(&crate::settings::LoginState::NeedCode),
+    };
+    let running = match home {
+        Some(h) => h.login.as_ref().is_some_and(|(_, st, _)| st == "running"),
+        None => local_state == Some(&crate::settings::LoginState::Running),
+    };
+
+    g.queue_icon(provider.icon(), x, *y - 1.0, 17.0, theme::text());
+    draw_text(g, x + 24.0, *y, provider.label(), 14.5, theme::text(), true);
+    if crate::verification_run()
+        && std::env::var("KASATERM_AUTOSETTINGS_ACTION")
+            .is_ok_and(|value| value.starts_with("account-usage-"))
+    {
+        let label = "검증용 예시";
+        let label_w = g.measure_chrome_text(label, 10.5, false);
+        draw_text(
+            g,
+            x + w - label_w,
+            *y + 2.0,
+            label,
+            10.5,
+            theme::text_mute(),
+            false,
+        );
+    }
+    *y += 23.0;
+    let blurb = match provider {
+        AccountProvider::Claude => {
+            "등록한 계정을 선택해 사용합니다. 계정이 2개 이상이면 한도에 맞춰 자동 전환할 수 있어요."
+        }
+        AccountProvider::Codex => {
+            "코덱스도 같은 방식으로 여러 계정을 둘 수 있습니다. 인증은 이 기기에 남습니다."
+        }
+    };
+    let blurb = fit(g, blurb, w, 11.0, false);
+    draw_text(g, x, *y, &blurb, 11.0, theme::text_dim(), false);
+    *y += 26.0;
+    // 기계를 고르는 두 칸. claude 는 **양쪽에서 돌기 때문에** 한쪽만 보여 주면
+    // 하단 상태줄(늘 이 기계 것)과 어긋난다(2026-09-05 사용자 「설정창이랑 하단이랑
+    // 왜 다른데」). 본진이 없거나 꺼져 있으면 칸을 안 그린다 — 고를 것이 하나뿐인
+    // 화면에 선택지를 세우면 그 자체가 물음이 된다.
+    if provider == AccountProvider::Claude {
+        if let Some(view) = s.home_accounts.as_ref() {
+            segmented(
+                g,
+                s,
+                hits,
+                x,
+                *y,
+                w.min(360.0),
+                &[
+                    (
+                        "이 맥북",
+                        !s.account_scope_home,
+                        SettingsAction::AccountScopeHome(false),
+                    ),
+                    (
+                        &view.label,
+                        s.account_scope_home,
+                        SettingsAction::AccountScopeHome(true),
+                    ),
+                ],
+            );
+            *y += 40.0;
+            let note = if s.account_scope_home {
+                format!("{} 에서 도는 claude 의 계정이에요", view.label)
+            } else {
+                "이 맥북에서 도는 claude 의 계정이에요 — 하단 막대에 뜨는 숫자가 이것".to_string()
+            };
+            for line in wrap_words(g, &note, w, 10.5) {
+                draw_text(g, x, *y, &line, 10.5, theme::text_mute(), false);
+                *y += 15.0;
+            }
+            *y += 9.0;
+        }
+    }
+
+    // 목록 머리. 추가 단추는 **목록 위 오른쪽** — 새 줄이 어디에 생기는지가
+    // 단추 자리로 설명되고, 계정이 늘어도 단추가 화면 아래로 도망가지 않는다.
+    let add = match provider {
+        AccountProvider::Claude => SettingsAction::AddClaudeAccount,
+        AccountProvider::Codex => SettingsAction::AddCodexAccount,
+    };
+    draw_text(g, x, *y + 5.0, "계정", 12.5, theme::text(), true);
+    if !needs_code && !running {
+        button(
+            g,
+            s,
+            hits,
+            (x + w - 104.0, *y, 104.0, 30.0),
+            "계정 추가",
+            Target::Setting(add),
+            false,
+        );
+    }
+    *y += 26.0;
+    let rows: Vec<&AccountChoice> = home.map_or(s.accounts.as_ref(), |h| h.accounts.as_ref())
+        .iter().filter(|row| row.provider == provider && (provider != AccountProvider::Claude || !row.id.is_empty())).collect();
+    let selection_note = if provider == AccountProvider::Claude && !rows.iter().any(|row| row.active) {
+        "계정 선택 필요 · 외부 CLI 로그인은 그대로 유지됩니다"
+    } else {
+        "계정을 눌러 선택하고 사용량을 펼쳐 확인하세요"
+    };
+    let selection_note = fit(g, selection_note, w, 10.5, false);
+    draw_text(
+        g,
+        x,
+        *y,
+        &selection_note,
+        10.5,
+        theme::text_mute(),
+        false,
+    );
+    *y += 22.0;
+
+    if let Some(h) = home {
+        if let Some(why) = h.error.as_deref() {
+            for line in wrap_words(g, why, w - 4.0, 10.5) {
+                draw_text(g, x + 2.0, *y, &line, 10.5, theme::danger(), false);
+                *y += 15.0;
+            }
+            *y += 3.0;
+        }
+    }
+    if rows.is_empty() && home.is_none_or(|h| h.error.is_none()) {
+        for line in wrap_words(g, "등록된 계정이 없어요. 위의 ‘계정 추가’로 시작하세요.", w - 4.0, 11.0) {
+            draw_text(g, x + 2.0, *y, &line, 11.0, theme::text_dim(), false);
+            *y += 16.0;
+        }
+        *y += 8.0;
+    }
+    for row in rows {
+        account_row(g, s, hits, caret, x, y, w, row);
+    }
+
+    if needs_code {
+        // 브라우저가 승인해도 CLI 로 돌아오는 길이 없다 — 화면에 뜬 코드를 여기
+        // 붙여넣어야 로그인이 끝난다. 이 칸이 없던 동안 로그인은 전부 실패했다.
+        *y += 4.0;
+        draw_text(
+            g,
+            x,
+            *y,
+            "브라우저에서 「승인」을 누르면 끝나요 — 코드가 보이면 복사만 하셔도 됩니다",
+            11.0,
+            theme::attention(),
+            false,
+        );
+        *y += 20.0;
+        text_field(
+            g,
+            s,
+            hits,
+            caret,
+            x,
+            *y,
+            (w - 178.0).max(140.0),
+            "",
+            &s.login_code,
+            SettingsInput::LoginCode,
+            s.settings_caret,
+            false,
+        );
+        button(
+            g,
+            s,
+            hits,
+            (x + w - 172.0, *y, 76.0, 31.0),
+            "확인",
+            Target::Setting(SettingsAction::SubmitLoginCode),
+            true,
+        );
+        button(
+            g,
+            s,
+            hits,
+            (x + w - 92.0, *y, 92.0, 31.0),
+            "로그인 취소",
+            Target::Setting(SettingsAction::CancelLogin),
+            false,
+        );
+        *y += 42.0;
+    } else if running {
+        *y += 4.0;
+        draw_text(g, x, *y + 9.0, "로그인 진행 중", 11.5, theme::text_dim(), false);
+        button(
+            g,
+            s,
+            hits,
+            (x + w - 92.0, *y, 92.0, 31.0),
+            "로그인 취소",
+            Target::Setting(SettingsAction::CancelLogin),
+            false,
+        );
+        *y += 42.0;
+    } else {
+        *y += 6.0;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn account_row(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret: &mut Option<Rect>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    row: &AccountChoice,
+) {
+    let editing = s
+        .account_label_edit
+        .as_ref()
+        .is_some_and(|(provider, id, _)| *provider == row.provider && id == &row.id);
+    let busy = s.login_job.as_ref().is_some_and(|job| {
+        matches!(
+            job.state,
+            crate::settings::LoginState::Running | crate::settings::LoginState::NeedCode
+        )
+    }) || s.home_accounts.as_ref().is_some_and(|h| {
+        h.login
+            .as_ref()
+            .is_some_and(|(_, st, _)| st == "running" || st == "need_code")
+    });
+    // 별명·격리·제거는 **등록한 슬롯**의 것이다 — 기본 로그인은 목록에 없는
+    // 암묵적 줄이라 이름을 붙일 데도 지울 대상도 없다.
+    let show_slot_actions = row.slot && !editing && !busy;
+    // 다시 로그인은 **모든 줄**에 있다. 기본 로그인도 만료되면 똑같이 풀리는데,
+    // 그 줄에만 단추가 없어 고치러 갈 데가 없었다(2026-09-07 「코덱슨 왜 재인증
+    // 이런거없어」 — codex 는 등록 슬롯이 없어 늘 이 줄뿐이다).
+    let show_actions = !editing && !busy;
+    let usage_key = account_usage_key(row.provider, &row.id);
+    let expanded = !editing && s.account_usage_expanded.contains(&usage_key);
+    let detail_lines = expanded.then(|| account_usage_lines(row)).unwrap_or_default();
+    let detail_h = if expanded {
+        match row.usage_state {
+            AccountUsageState::Ready => 16.0 + detail_lines.len().max(1) as f32 * 54.0,
+            _ => 58.0,
+        }
+    } else {
+        0.0
+    };
+    let rect = (x, *y, w, if editing { 62.0 } else { 84.0 + detail_h });
+    choice_card(
+        g,
+        s,
+        hits,
+        rect,
+        row.active,
+        Target::Setting(SettingsAction::SwitchAccount(row.provider, row.id.clone())),
+    );
+    g.queue_icon(
+        row.provider.icon(),
+        rect.0 + 12.0,
+        rect.1 + 12.0,
+        17.0,
+        if row.active {
+            theme::accent()
+        } else {
+            theme::text_mute()
+        },
+    );
+    if editing {
+        let value = s
+            .account_label_edit
+            .as_ref()
+            .map(|(_, _, value)| value.as_str())
+            .unwrap_or_default();
+        text_field(
+            g,
+            s,
+            hits,
+            caret,
+            rect.0 + 40.0,
+            rect.1 + 4.0,
+            (w - 54.0).max(120.0),
+            "별명",
+            value,
+            SettingsInput::AccountLabel,
+            s.settings_caret,
+            false,
+        );
+        *y += rect.3 + 6.0;
+        return;
+    }
+
+    // 오른쪽 단추 묶음의 폭을 **먼저** 재 둔다 — 이름과 부제가 그 자리를 넘지
+    // 않게 잘라야 하는데, 글자 단추는 라벨 길이에 따라 폭이 달라진다.
+    let w_remove = g.measure_chrome_text("제거", 10.5, false) + 32.0;
+    let w_reauth = g.measure_chrome_text("재인증", 10.5, false) + 32.0;
+    let actions_w = if show_slot_actions {
+        w_remove + w_reauth + 2.0 + 60.0 + 10.0
+    } else if show_actions {
+        w_reauth + 10.0
+    } else {
+        14.0
+    };
+    let text_x = rect.0 + 40.0;
+    let avail = (rect.0 + rect.2 - actions_w - text_x).max(80.0);
+
+    // 선택만으로 로그인 완료를 단정할 수 없다.
+    let badge = if row.active { Some("선택됨") } else { None };
+    let badge_w = badge
+        .map(|t| g.measure_chrome_text(t, 9.5, false) + 22.0)
+        .unwrap_or(0.0);
+    let shown = fit(g, &row.name, w - 54.0 - badge_w, 12.0, row.active);
+    let name_w = g.measure_chrome_text(&shown, 12.0, row.active);
+    draw_text(g, text_x, rect.1 + 8.0, &shown, 12.0, theme::text(), row.active);
+    if let Some(t) = badge {
+        pill(g, text_x + name_w + 8.0, rect.1 + 7.0, t, true);
+    }
+
+    // 긴 신원 문자열이 관리 단추에 가리지 않도록 사용량과 동작은 다음 줄에 둔다.
+    let home_sub = s.home_accounts.as_ref().and_then(|h| {
+        let (id, state, err) = h.login.as_ref()?;
+        (id == &row.id).then(|| match state.as_str() {
+            "running" => "로그인 진행 중".to_string(),
+            "need_code" => "코드를 기다리는 중".to_string(),
+            "ok" => "로그인을 마쳤어요".to_string(),
+            _ => err.clone().unwrap_or_else(|| "로그인이 실패했어요".to_string()),
+        })
+    });
+    let job_sub = home_sub.or_else(|| {
+        s.login_job
+            .as_ref()
+            .filter(|job| job.provider == row.provider && job.id == row.id)
+            .map(|job| match &job.state {
+                crate::settings::LoginState::Running => "로그인 진행 중".to_string(),
+                crate::settings::LoginState::NeedCode => "코드를 기다리는 중".to_string(),
+                crate::settings::LoginState::Ok => "로그인을 마쳤어요".to_string(),
+                crate::settings::LoginState::Err(error) => error.clone(),
+            })
+    });
+    let (usage_text, usage_pct) = account_usage_summary(row);
+    let usage_text = fit(g, &usage_text, (avail - 20.0).max(24.0), 10.5, false);
+    let usage_w = g.measure_chrome_text(&usage_text, 10.5, false) + 22.0;
+    let usage_left = text_x;
+    let usage_right = usage_left + usage_w.min(avail);
+    let sub_value = job_sub.as_deref().unwrap_or(&row.sub);
+    let mut sub_x = text_x;
+    // 메일 서비스 표지는 **부제가 그 계정을 말할 때만** — 로그인 진행 같은 상태
+    // 문구 앞에 세우면 그게 주소인 줄로 읽힌다.
+    if job_sub.is_none() && !row.email.is_empty() && w >= 100.0 {
+        let d = email_provider_mark(g, sub_x, rect.1 + 27.0, &row.email, 14.0);
+        if d > 0.0 {
+            sub_x += d + 6.0;
+        }
+    }
+    let sub_room = rect.0 + w - 14.0 - sub_x;
+    if !sub_value.is_empty() && sub_room >= 24.0 {
+        let sub = fit(g, sub_value, sub_room, 10.5, false);
+        draw_text(
+            g,
+            sub_x,
+            rect.1 + 29.0,
+            &sub,
+            10.5,
+            if row.sub_kind == "danger" {
+                theme::danger()
+            } else {
+                theme::text_mute()
+            },
+            false,
+        );
+    }
+    draw_text(
+        g,
+        usage_left,
+        rect.1 + 58.0,
+        &usage_text,
+        10.5,
+        usage_pct.map_or_else(
+            || account_usage_state_color(row.usage_state),
+            account_usage_pct_color,
+        ),
+        false,
+    );
+    g.queue_icon(
+        if expanded { "chevron-up" } else { "chevron-down" },
+        usage_right - 14.0,
+        rect.1 + 57.0,
+        13.0,
+        theme::text_mute(),
+    );
+    let usage_hit = (
+        usage_left - 6.0,
+        rect.1 + 51.0,
+        (usage_right - usage_left + 8.0).max(34.0),
+        27.0,
+    );
+    register_clipped(
+        g,
+        hits,
+        Target::AccountUsage(usage_key.clone()),
+        usage_hit,
+        HitCursor::Pointer,
+    );
+    g.hover_pointer |= contains(usage_hit, s.cursor);
+
+    if expanded {
+        let detail = (rect.0 + 8.0, rect.1 + 85.0, rect.2 - 16.0, detail_h - 8.0);
+        g.rect(detail.0, detail.1 - 1.0, detail.2, 1.0, theme::border());
+        match row.usage_state {
+            AccountUsageState::Ready => {
+                let mut line_y = detail.1 + 10.0;
+                for line in &detail_lines {
+                    draw_account_usage_line(g, line, detail.0 + 32.0, line_y, detail.2 - 44.0, row.usage.as_ref().is_some_and(|usage| usage.stale));
+                    line_y += 54.0;
+                }
+            }
+            state => {
+                let text = account_usage_state_text(state);
+                draw_text(
+                    g,
+                    detail.0 + 32.0,
+                    detail.1 + 18.0,
+                    text,
+                    11.5,
+                    account_usage_state_color(state),
+                    false,
+                );
+            }
+        }
+        register_clipped(
+            g,
+            hits,
+            Target::AccountUsage(usage_key),
+            detail,
+            HitCursor::Pointer,
+        );
+        g.hover_pointer |= contains(detail, s.cursor);
+    }
+
+    if show_actions {
+        let by = rect.1 + 51.0;
+        let mut rx = rect.0 + rect.2 - 8.0 - w_reauth;
+        if show_slot_actions {
+            rx = rect.0 + rect.2 - 8.0 - w_remove;
+            let action = match row.provider {
+                AccountProvider::Claude => SettingsAction::RemoveClaudeAccount(row.id.clone()),
+                AccountProvider::Codex => SettingsAction::RemoveCodexAccount(row.id.clone()),
+            };
+            mini_text_button(
+                g,
+                s,
+                hits,
+                rx,
+                by,
+                "trash-2",
+                "제거",
+                Target::Setting(action),
+                true,
+            );
+            rx -= w_reauth + 2.0;
+        }
+        mini_text_button(
+            g,
+            s,
+            hits,
+            rx,
+            by,
+            "rotate-cw",
+            "재인증",
+            Target::Setting(SettingsAction::ReauthAccount(
+                row.provider,
+                row.id.clone(),
+                settings::LoginBrowser::Default,
+            )),
+            false,
+        );
+        // 별명과 격리 로그인은 어쩌다 한 번이라 아이콘으로 남긴다 — 글자까지
+        // 세우면 이름이 들어갈 자리가 사라진다.
+        if !show_slot_actions {
+            *y += rect.3 + 6.0;
+            return;
+        }
+        rx -= 30.0;
+        mini_icon_button(
+            g,
+            s,
+            hits,
+            (rx, by, 26.0, 26.0),
+            "shield",
+            Target::Setting(SettingsAction::ReauthAccount(
+                row.provider,
+                row.id.clone(),
+                settings::LoginBrowser::Isolated,
+            )),
+        );
+        rx -= 30.0;
+        mini_icon_button(
+            g,
+            s,
+            hits,
+            (rx, by, 26.0, 26.0),
+            "pencil",
+            Target::Setting(SettingsAction::FocusAccountLabel(
+                row.provider,
+                row.id.clone(),
+            )),
+        );
+    }
+    *y += rect.3 + 6.0;
+}
+
+#[derive(Clone)]
+struct AccountUsageLine {
+    label: String,
+    pct: Option<f32>,
+    resets_at: Option<u64>,
+}
+
+fn account_usage_lines(row: &AccountChoice) -> Vec<AccountUsageLine> {
+    let mut source = row.usage_windows.clone();
+    if source.is_empty() {
+        if let Some(usage) = row.usage.as_ref() {
+            source.push(crate::UsageWindowBadge {
+                label: usage.label.clone(),
+                pct: usage.pct,
+                resets_at: usage.resets_at,
+            });
+        }
+    }
+    let pick = |kind: &str| {
+        source.iter().find(|window| match kind {
+            "5h" => window.label == "5h",
+            "7d" => window.label == "7d",
+            _ => false,
+        })
+    };
+    let mut out = vec![
+        pick("5h").map_or(
+            AccountUsageLine {
+                label: "5시간".to_string(),
+                pct: None,
+                resets_at: None,
+            },
+            |window| AccountUsageLine {
+                label: "5시간".to_string(),
+                pct: Some(window.pct),
+                resets_at: window.resets_at,
+            },
+        ),
+        pick("7d").map_or(
+            AccountUsageLine {
+                label: "7일".to_string(),
+                pct: None,
+                resets_at: None,
+            },
+            |window| AccountUsageLine {
+                label: "7일".to_string(),
+                pct: Some(window.pct),
+                resets_at: window.resets_at,
+            },
+        ),
+    ];
+    let mut models: Vec<AccountUsageLine> = source
+        .iter()
+        .filter(|window| window.label != "5h" && window.label != "7d")
+        .map(|window| AccountUsageLine {
+            label: window
+                .label
+                .strip_prefix("7d ")
+                .map(|model| format!("{model} · 7일"))
+                .or_else(|| {
+                    window
+                        .label
+                        .strip_prefix("5h ")
+                        .map(|model| format!("{model} · 5시간"))
+                })
+                .unwrap_or_else(|| window.label.clone()),
+            pct: Some(window.pct),
+            resets_at: window.resets_at,
+        })
+        .collect();
+    if models.is_empty() {
+        models.push(AccountUsageLine {
+            label: "모델별 한도".to_string(),
+            pct: None,
+            resets_at: None,
+        });
+    }
+    out.extend(models);
+    out
+}
+
+fn account_usage_state_text(state: AccountUsageState) -> &'static str {
+    match state {
+        AccountUsageState::Ready => "한도 미제공",
+        AccountUsageState::Loading => "한도 조회 중…",
+        AccountUsageState::Failed => "한도를 읽지 못했어요",
+        AccountUsageState::LoggedOut => "로그인 후 사용량을 볼 수 있어요",
+    }
+}
+
+fn account_usage_summary(row: &AccountChoice) -> (String, Option<f32>) {
+    match (row.usage_state, row.usage.as_ref()) {
+        (AccountUsageState::Ready, Some(usage)) => (
+            format!("{}{:.0}%", if usage.stale { "이전 " } else { "" }, usage.pct),
+            (!usage.stale).then_some(usage.pct),
+        ),
+        (AccountUsageState::Failed, Some(usage)) => (
+            format!("이전 {:.0}% · 조회 실패", usage.pct),
+            None,
+        ),
+        (state, _) => (account_usage_state_text(state).to_string(), None),
+    }
+}
+
+fn account_usage_pct_color(pct: f32) -> [u8; 4] {
+    if pct >= 90.0 {
+        theme::danger()
+    } else if pct >= 70.0 {
+        theme::attention()
+    } else {
+        theme::text_dim()
+    }
+}
+
+fn account_usage_state_color(state: AccountUsageState) -> [u8; 4] {
+    match state {
+        AccountUsageState::Failed | AccountUsageState::LoggedOut => theme::danger(),
+        _ => theme::text_mute(),
+    }
+}
+
+fn draw_account_usage_line(
+    g: &mut gpu::GpuRenderer,
+    line: &AccountUsageLine,
+    x: f32,
+    y: f32,
+    w: f32,
+    stale: bool,
+) {
+    let pct_text = line.pct.map(|pct| {
+        format!("{}{pct:.0}%", if stale { "~" } else { "" })
+    });
+    let pct_w = pct_text
+        .as_ref()
+        .map(|text| g.measure_chrome_text(text, 11.0, true))
+        .unwrap_or_else(|| g.measure_chrome_text("미제공", 10.5, false));
+    let label = fit(g, &line.label, (w - pct_w - 14.0).max(30.0), 11.5, true);
+    draw_text(g, x, y, &label, 11.5, theme::text(), true);
+    match (line.pct, pct_text) {
+        (Some(pct), Some(text)) => {
+            draw_text(
+                g,
+                x + w - pct_w,
+                y,
+                &text,
+                11.0,
+                account_usage_pct_color(pct),
+                true,
+            );
+            let bar_y = y + 21.0;
+            round_rect(g, x, bar_y, w, 5.0, 2.5, theme::surface_active());
+            round_rect(
+                g,
+                x,
+                bar_y,
+                (w * (pct / 100.0).clamp(0.0, 1.0)).max(5.0),
+                5.0,
+                2.5,
+                account_usage_pct_color(pct),
+            );
+            let reset = line
+                .resets_at
+                .and_then(|at| crate::resets_in_label(Some(at)))
+                .map(|value| format!("{value} 뒤 초기화"))
+                .unwrap_or_else(|| "초기화 정보 미제공".to_string());
+            let reset = if stale { format!("최근 값 · {reset}") } else { reset };
+            let reset = fit(g, &reset, w, 10.0, false);
+            draw_text(g, x, y + 34.0, &reset, 10.0, theme::text_mute(), false);
+        }
+        _ => {
+            draw_text(
+                g,
+                x + w - pct_w,
+                y,
+                "미제공",
+                10.5,
+                theme::text_mute(),
+                false,
+            );
+        }
+    }
+}
+
+fn cursor_shape_label(shape: cursor::CursorShape) -> &'static str {
+    match shape {
+        cursor::CursorShape::Block => "블록",
+        cursor::CursorShape::Bar => "빔",
+        cursor::CursorShape::Underline => "밑줄",
+        cursor::CursorShape::Frame => "프레임",
+        cursor::CursorShape::Brackets => "괄호",
+        cursor::CursorShape::TwinRails => "쌍선",
+        cursor::CursorShape::Topline => "윗줄",
+        cursor::CursorShape::CornerMarks => "모서리",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cursor_shape_grid(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    shapes: &[(cursor::CursorShape, &str)],
+) {
+    let cols = if w >= 540.0 {
+        3
+    } else if w >= 300.0 {
+        2
+    } else {
+        1
+    };
+    let gap = 8.0;
+    let card_h = 64.0;
+    let card_w = (w - gap * (cols - 1) as f32) / cols as f32;
+    for (index, (shape, label)) in shapes.iter().copied().enumerate() {
+        let col = index % cols;
+        let row = index / cols;
+        let rect = (
+            x + col as f32 * (card_w + gap),
+            *y + row as f32 * (card_h + gap),
+            card_w,
+            card_h,
+        );
+        choice_card(
+            g,
+            s,
+            hits,
+            rect,
+            s.cursor_shape == shape,
+            Target::Setting(SettingsAction::CursorShape(shape)),
+        );
+        let shown = fit(g, label, (rect.2 - 78.0).max(30.0), 12.0, s.cursor_shape == shape);
+        draw_text(
+            g,
+            rect.0 + 12.0,
+            rect.1 + 24.0,
+            &shown,
+            12.0,
+            if s.cursor_shape == shape {
+                theme::text()
+            } else {
+                theme::text_dim()
+            },
+            s.cursor_shape == shape,
+        );
+        cursor_sample(
+            g,
+            shape,
+            rect.0 + rect.2 - 50.0,
+            rect.1 + 17.0,
+            s.cursor_thickness,
+            true,
+            s.cursor_color,
+        );
+    }
+    let rows = (shapes.len() + cols - 1) / cols;
+    *y += rows as f32 * card_h + rows.saturating_sub(1) as f32 * gap;
+}
+
+fn cursor_sample(
+    g: &mut gpu::GpuRenderer,
+    shape: cursor::CursorShape,
+    x: f32,
+    y: f32,
+    thickness: f32,
+    compact: bool,
+    color: [u8; 4],
+) {
+    let cw = if compact { 9.0 } else { 11.0 };
+    let ch = if compact { 23.0 } else { 29.0 };
+    let width = cw * 2.0;
+    stroke_round(
+        g,
+        (x - 5.0, y - 4.0, width + 10.0, ch + 8.0),
+        theme::radius_sm(),
+        theme::border(),
+    );
+    draw_text(
+        g,
+        x + 2.0,
+        y + 4.0,
+        "가",
+        if compact { 12.0 } else { 15.0 },
+        theme::text_dim(),
+        false,
+    );
+    let mut color = color;
+    color[3] = if compact { 210 } else { 175 };
+    for quad in cursor::cursor_primitives(shape, x, y, cw, ch, 2, thickness).as_slice() {
+        g.rect(quad.x, quad.y, quad.width, quad.height, color);
+    }
+}
+
+fn category_meta(cat: SettingsCat) -> (&'static str, &'static str, &'static str) {
+    match cat {
+        SettingsCat::General => (
+            "일반",
+            "settings-2",
+            "시작 위치와 파일, 스크롤의 기본값을 정합니다",
+        ),
+        SettingsCat::Appearance => (
+            "모양",
+            "sparkles",
+            "색과 글자 크기, 화면 배율을 한 화면에서 맞춥니다",
+        ),
+        SettingsCat::Statusbar => (
+            "하단바",
+            "panel-bottom",
+            "보이는 정보와 순서, 색을 내 작업에 맞춥니다",
+        ),
+        SettingsCat::Shell => (
+            "터미널",
+            "terminal",
+            "새 pane의 셸과 커서를 정합니다",
+        ),
+        SettingsCat::Pet => (
+            "펫",
+            "sparkles",
+            "바탕화면에 서서 학생들 상황을 알려 주는 캐릭터입니다",
+        ),
+        SettingsCat::Claude => (
+            "Agent",
+            "claude",
+            "모델과 협업 연결의 기본값을 정합니다",
+        ),
+        SettingsCat::Accounts => (
+            "계정",
+            "users",
+            "로그인을 넣고, 한도가 차면 넘어갈 차례를 정합니다",
+        ),
+        SettingsCat::Machines => (
+            "기계",
+            "server",
+            "ssh 로 붙는 다른 컴퓨터를 등록합니다",
+        ),
+        SettingsCat::Theme => ("테마", "image", "캐릭터 명단과 그림을 한 벌로 갈아낍니다"),
+        SettingsCat::Students => ("캐릭터", "users", "테마를 섞어 사용할 캐릭터를 고릅니다"),
+        SettingsCat::Feedback => (
+            "피드백",
+            "message-square-warning",
+            "불편한 점을 이 기기에 기록합니다",
+        ),
+    }
+}
+
+/// 묶음 제목. 목업의 `.group h2` — 작은 흐림 글자 하나. 부르는 쪽이 이어서
+/// 54 를 더하므로 제목은 그 아래쪽(첫 행 바로 위)에 앉힌다. 설명은 행마다
+/// 붙는 보조글로 옮겨 가고 여기선 그리지 않는다(2026-09-10 「카드 다 제거하고 플랫하게」).
+fn section_title(g: &mut gpu::GpuRenderer, x: f32, y: f32, title: &str, _desc: &str) {
+    draw_text(g, x, y + 30.0, title, 11.0, theme::text_dim(), false);
+}
+
+/// 플랫 행 하나: 왼쪽 이름(+보조글), 아래 얇은 선. 조작은 부르는 쪽이 오른쪽에 얹는다.
+/// 돌려주는 값은 행 사각형.
+fn flat_row(g: &mut gpu::GpuRenderer, x: f32, y: f32, w: f32, label: &str, hint: &str, text_w: f32) -> Rect {
+    let rect = (x, y, w, ROW_H);
+    let label = fit(g, label, text_w.max(0.0), 12.0, false);
+    let hint = fit(g, hint, text_w.max(0.0), 10.5, false);
+    if hint.is_empty() {
+        draw_text(g, x, y + 13.0, &label, 12.0, theme::text(), false);
+    } else {
+        draw_text(g, x, y + 7.0, &label, 12.0, theme::text(), false);
+        draw_text(g, x, y + 24.0, &hint, 10.5, theme::text_dim(), false);
+    }
+    g.rect(x, y + ROW_H - 1.0, w, 1.0, theme::with_alpha(theme::border(), 140));
+    rect
+}
+
+/// 이름표 + 구분 선택을 한 행에. 목업의 「새 방의 시작 폴더 · [마지막 위치|홈|직접 지정]」.
+fn seg_row(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    label: &str,
+    cells: &[(&str, bool, SettingsAction)],
+) {
+    let label_w = g.measure_chrome_text(&crate::native_strings::text(label), 12.0, false).min(w * 0.4);
+    flat_row(g, x, *y, w, label, "", label_w);
+    let control_x = x + label_w + 12.0;
+    segmented(g, s, hits, control_x, *y + (ROW_H - CTL_H) / 2.0, (x + w - control_x).max(0.0), cells);
+    *y += ROW_H;
+}
+
+/// 선택 줄(`segmented`) 위에 서는 한 줄 이름표. 줄이 둘 이상 잇달아 서면 어느 줄이
+/// 무엇을 고르는지 칸 글자만으로는 안 읽혔다(「끔 · 1초 · 3초」가 무엇의 간격인지) —
+/// 2026-09-07 「자잘한 것들 다 수정」.
+fn row_label(g: &mut gpu::GpuRenderer, x: f32, y: &mut f32, label: &str) {
+    draw_text(g, x + 2.0, *y, label, 12.0, theme::text_dim(), false);
+    *y += 20.0;
+}
+
+fn info_slab(g: &mut gpu::GpuRenderer, x: f32, y: &mut f32, w: f32, text: &str) {
+    let rect = (x, *y, w, 48.0);
+    // 목업(플랫): 채움 없이 테두리만.
+    stroke_round(g, rect, ctrl_radius(), theme::border());
+    let shown = fit(g, text, rect.2 - 28.0, 12.0, false);
+    draw_text(
+        g,
+        rect.0 + 14.0,
+        rect.1 + 16.0,
+        &shown,
+        12.0,
+        theme::text_dim(),
+        false,
+    );
+    *y += rect.3 + 8.0;
+}
+
+fn toggle_row(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    label: &str,
+    on: bool,
+    action: SettingsAction,
+) {
+    toggle_row_hint(g, s, hits, x, y, w, label, "", on, action);
+}
+
+/// 이름표 밑에 작은 설명이 붙는 토글 줄.
+fn toggle_row_hint(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    label: &str,
+    hint: &str,
+    on: bool,
+    action: SettingsAction,
+) {
+    // 목업: 채움 없는 토글. 꺼짐은 회색 테두리+회색 점, 켜짐은 강조색 테두리+강조색 점.
+    let rect = flat_row(g, x, *y, w, label, hint, w - 44.0);
+    let hover = contains(rect, s.cursor);
+    let toggle = (rect.0 + rect.2 - 32.0, rect.1 + 11.0, 32.0, 18.0);
+    let line = if on {
+        theme::accent()
+    } else if hover {
+        theme::text_dim()
+    } else {
+        theme::border()
+    };
+    stroke_round(g, toggle, 9.0, line);
+    round_rect(
+        g,
+        toggle.0 + if on { 17.0 } else { 3.0 },
+        toggle.1 + 3.0,
+        12.0,
+        12.0,
+        6.0,
+        if on { theme::accent() } else { theme::text_mute() },
+    );
+    register_clipped(g, hits, Target::Setting(action), rect, HitCursor::Pointer);
+    g.hover_pointer |= hover;
+    *y += ROW_H;
+}
+
+fn segmented(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: f32,
+    w: f32,
+    cells: &[(&str, bool, SettingsAction)],
+) {
+    if cells.is_empty() || w <= 4.0 {
+        return;
+    }
+    // 목업(플랫): 칸 너비는 글자에 맞추고 상자는 오른쪽 끝에 붙는다. 채움 없이
+    // 테두리 하나, 고른 칸만 강조색 테두리+글자. 두 개짜리(언어)가 화면을
+    // 가로지르던 것을 없앴다(2026-09-10 지적).
+    let h = CTL_H;
+    let inset = 2.0;
+    let pad = 10.0;
+    let widths: Vec<f32> = cells
+        .iter()
+        .map(|(label, selected, _)| g.measure_chrome_text(label, 12.0, *selected) + pad * 2.0)
+        .collect();
+    let total = widths.iter().sum::<f32>() + inset * 2.0;
+    let outer = (x + w - total.min(w), y, total.min(w), h);
+    let scale = ((outer.2 - inset * 2.0) / (total - inset * 2.0)).min(1.0);
+    stroke_round(g, outer, seg_outer_radius(), theme::border());
+    let mut cx = outer.0 + inset;
+    for (i, (label, selected, action)) in cells.iter().enumerate() {
+        let cw = widths[i] * scale;
+        let rect = (cx, y + inset, cw, h - inset * 2.0);
+        cx += cw;
+        let hover = contains(rect, s.cursor);
+        if *selected {
+            stroke_round(g, rect, seg_inner_radius(), theme::accent());
+        }
+        let shown = fit(g, label, cw - 8.0, 12.0, *selected);
+        let tx = rect.0 + (rect.2 - g.measure_chrome_text(&shown, 12.0, *selected)) / 2.0;
+        draw_text(
+            g,
+            tx,
+            rect.1 + 3.5,
+            &shown,
+            12.0,
+            if *selected {
+                theme::accent()
+            } else if hover {
+                theme::text()
+            } else {
+                theme::text_dim()
+            },
+            *selected,
+        );
+        register_clipped(g, hits, Target::Setting(action.clone()), rect, HitCursor::Pointer);
+        g.hover_pointer |= hover;
+    }
+}
+
+fn chips_owned(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    cells: Vec<(String, bool, SettingsAction)>,
+) {
+    let mut cx = x;
+    let mut cy = *y;
+    for (label, selected, action) in cells {
+        let cw = (g.measure_chrome_text(&label, 12.0, selected) + 22.0).min(w);
+        if cx + cw > x + w && cx > x {
+            cx = x;
+            cy += 30.0;
+        }
+        let rect = (cx, cy, cw, 24.0);
+        choice_card_with_radius(g, s, hits, rect, selected, Target::Setting(action), chip_radius());
+        // 반 픽셀을 더 준다. 칸 너비를 같은 함수로 재 놓고 그 값으로 다시 자르는데,
+        // 두 번의 재기가 소수점에서 갈리면 딱 맞는 이름이 「Ma…」로 잘린다(실측).
+        let shown = fit(g, &label, rect.2 - 21.5, 12.0, selected);
+        draw_text(
+            g,
+            rect.0 + 11.0,
+            rect.1 + 5.5,
+            &shown,
+            12.0,
+            if selected {
+                theme::accent()
+            } else {
+                theme::text_dim()
+            },
+            selected,
+        );
+        cx += cw + 6.0;
+    }
+    *y = cy + 36.0;
+}
+
+/// 선택 상자에 뜨는 값 이름. 「terminal」·「system」·빈 값은 사람 말로 바꾼다.
+fn ui_font_label(value: &str) -> String {
+    match value {
+        "" | "terminal" => "터미널 글꼴 그대로".to_string(),
+        "system" => "시스템 고딕".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 선택 상자에 들어갈 항목들: (보이는 이름, 지금 골라진 것인지, 고르면 할 일).
+fn dropdown_items(s: &Snapshot, id: DropdownId) -> Vec<(String, bool, SettingsAction)> {
+    match id {
+        DropdownId::UiFont => {
+            let custom = !matches!(s.ui_font.as_str(), "" | "terminal" | "system");
+            let mut items = vec![
+                (
+                    ui_font_label("terminal"),
+                    !custom && s.ui_font != "system",
+                    SettingsAction::UiFont("terminal".to_string()),
+                ),
+                (
+                    ui_font_label("system"),
+                    s.ui_font == "system",
+                    SettingsAction::UiFont("system".to_string()),
+                ),
+            ];
+            items.extend(s.ui_fonts.iter().map(|f| {
+                (
+                    f.clone(),
+                    custom && crate::onboarding::ui_font_matches(&s.ui_font, f),
+                    SettingsAction::UiFont(f.clone()),
+                )
+            }));
+            items
+        }
+    }
+}
+
+const DROPDOWN_FIELD_W: f32 = 260.0;
+const DROPDOWN_FIELD_H: f32 = CTL_H;
+const DROPDOWN_ITEM_H: f32 = 28.0;
+const DROPDOWN_VISIBLE_ITEMS: f32 = 8.0;
+
+/// 라벨 왼쪽, 오른쪽에 닫힌 선택 상자 한 줄. 펼쳐져 있으면 자리를 기록해 두고
+/// 팝업은 `paint()` 끝에서 맨 위에 그린다.
+#[allow(clippy::too_many_arguments)]
+fn dropdown_row(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    label: &str,
+    value: &str,
+    id: DropdownId,
+) {
+    let fw = DROPDOWN_FIELD_W.min(w * 0.55);
+    flat_row(g, x, *y, w, label, "", w - fw - 12.0);
+    let rect = (x + w - fw, *y + (ROW_H - DROPDOWN_FIELD_H) / 2.0, fw, DROPDOWN_FIELD_H);
+    let open = s.dropdown == Some(id);
+    let hover = contains(rect, s.cursor);
+    round_rect(
+        g,
+        rect.0,
+        rect.1,
+        rect.2,
+        rect.3,
+        ctrl_radius(),
+        if open || hover {
+            theme::surface_hover()
+        } else {
+            theme::surface()
+        },
+    );
+    stroke_round(
+        g,
+        rect,
+        ctrl_radius(),
+        if open { theme::accent() } else { theme::border() },
+    );
+    let shown = fit(g, value, rect.2 - 40.0, 12.0, false);
+    draw_text(g, rect.0 + 10.0, rect.1 + 6.5, &shown, 12.0, theme::text(), false);
+    g.queue_icon(
+        if open { "chevron-up" } else { "chevron-down" },
+        rect.0 + rect.2 - 22.0,
+        rect.1 + 6.5,
+        13.0,
+        theme::text_dim(),
+    );
+    register_clipped(g, hits, Target::Dropdown(id), rect, HitCursor::Pointer);
+    g.hover_pointer |= hover;
+    if open {
+        if let Some(visible) = g.clip_hit(rect) {
+            let _ = visible;
+            mark_dropdown_anchor(id, rect);
+        }
+    }
+    *y += ROW_H;
+}
+
+/// 펼친 목록. 본문 클립 바깥에서, 모든 것 위에 그린다. 바깥 전체에 「닫기」 판정을
+/// 먼저 깔고 항목 판정을 그 위에 얹어, 어디를 눌러도 닫히되 항목은 항목으로 먹는다.
+/// 돌려주는 값은 목록의 최대 스크롤.
+fn paint_dropdown_popup(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    id: DropdownId,
+    anchor: Rect,
+) -> f32 {
+    let items = dropdown_items(s, id);
+    if items.is_empty() {
+        return 0.0;
+    }
+    register(hits, Target::DropdownDismiss, s.area, HitCursor::Arrow);
+    let pad = 6.0;
+    let full_h = items.len() as f32 * DROPDOWN_ITEM_H + pad * 2.0;
+    let max_h = DROPDOWN_VISIBLE_ITEMS * DROPDOWN_ITEM_H + pad * 2.0;
+    let area_bottom = s.area.1 + s.area.3 - 8.0;
+    let below = area_bottom - (anchor.1 + anchor.3 + 4.0);
+    let above = anchor.1 - 4.0 - (s.area.1 + 8.0);
+    let (h, top) = if below >= full_h.min(max_h) || below >= above {
+        let h = full_h.min(max_h).min(below.max(DROPDOWN_ITEM_H + pad * 2.0));
+        (h, anchor.1 + anchor.3 + 4.0)
+    } else {
+        let h = full_h.min(max_h).min(above.max(DROPDOWN_ITEM_H + pad * 2.0));
+        (h, anchor.1 - 4.0 - h)
+    };
+    let panel = (anchor.0, top, anchor.2, h);
+    let scroll_max = (full_h - h).max(0.0);
+    let scroll = s.dropdown_scroll.clamp(0.0, scroll_max);
+
+    // 그림자 — 살짝 큰 반투명 판을 아래로 밀어 띄운다.
+    round_rect(
+        g,
+        panel.0 - 1.0,
+        panel.1 + 2.0,
+        panel.2 + 2.0,
+        panel.3 + 2.0,
+        ctrl_radius() + 1.0,
+        theme::with_alpha([0, 0, 0, 255], 46),
+    );
+    round_rect(g, panel.0, panel.1, panel.2, panel.3, ctrl_radius(), theme::surface());
+    stroke_round(g, panel, ctrl_radius(), theme::border());
+
+    g.push_clip(panel.0 + 1.0, panel.1 + 1.0, panel.2 - 2.0, panel.3 - 2.0);
+    let mut iy = panel.1 + pad - scroll;
+    for (label, selected, action) in items {
+        let rect = (panel.0 + pad, iy, panel.2 - pad * 2.0, DROPDOWN_ITEM_H);
+        iy += DROPDOWN_ITEM_H;
+        if rect.1 + rect.3 < panel.1 || rect.1 > panel.1 + panel.3 {
+            continue;
+        }
+        let hover = contains(rect, s.cursor) && contains(panel, s.cursor);
+        if hover || selected {
+            round_rect(
+                g,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                theme::radius_sm(),
+                if selected {
+                    theme::surface_active()
+                } else {
+                    theme::surface_hover()
+                },
+            );
+        }
+        let shown = fit(g, &label, rect.2 - 40.0, 12.0, selected);
+        draw_text(
+            g,
+            rect.0 + 12.0,
+            rect.1 + 7.0,
+            &shown,
+            12.0,
+            if selected { theme::text() } else { theme::text_dim() },
+            selected,
+        );
+        if selected {
+            g.queue_icon(
+                "check",
+                rect.0 + rect.2 - 22.0,
+                rect.1 + 7.5,
+                13.0,
+                theme::accent(),
+            );
+        }
+        register_clipped(g, hits, Target::Setting(action), rect, HitCursor::Pointer);
+        g.hover_pointer |= hover;
+    }
+    g.pop_clip();
+    if scroll_max > 0.0 {
+        let track_h = panel.3 - pad * 2.0;
+        let thumb_h = (track_h * h / full_h).clamp(18.0, track_h);
+        let thumb_y = panel.1 + pad + (track_h - thumb_h) * (scroll / scroll_max);
+        round_rect(
+            g,
+            panel.0 + panel.2 - 6.0,
+            thumb_y,
+            3.0,
+            thumb_h,
+            1.5,
+            theme::with_alpha(theme::text_dim(), 120),
+        );
+    }
+    scroll_max
+}
+
+fn stepper_row(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: &mut f32,
+    w: f32,
+    label: &str,
+    value: &str,
+    minus: SettingsAction,
+    plus: SettingsAction,
+) {
+    // 목업(플랫): −·값·+ 가 채움 없는 테두리 하나 안에, 높이 26.
+    flat_row(g, x, *y, w, label, "", w - 116.0);
+    let right = x + w;
+    let bw = 26.0;
+    let vw = 52.0;
+    let boxr = (right - (bw * 2.0 + vw), *y + (ROW_H - CTL_H) / 2.0, bw * 2.0 + vw, CTL_H);
+    let mr = (boxr.0, boxr.1, bw, boxr.3);
+    let pr = (boxr.0 + bw + vw, boxr.1, bw, boxr.3);
+    for (cell, sign, action) in [(mr, "−", minus), (pr, "+", plus)] {
+        let hover = contains(cell, s.cursor);
+        let tx = cell.0 + (cell.2 - g.measure_chrome_text(sign, 13.0, false)) / 2.0;
+        draw_text(
+            g,
+            tx,
+            cell.1 + 5.5,
+            sign,
+            13.0,
+            if hover { theme::text() } else { theme::text_dim() },
+            false,
+        );
+        register_clipped(g, hits, Target::Setting(action), cell, HitCursor::Pointer);
+        g.hover_pointer |= hover;
+    }
+    g.rect(mr.0 + bw, boxr.1 + 1.0, 1.0, boxr.3 - 2.0, theme::border());
+    g.rect(pr.0, boxr.1 + 1.0, 1.0, boxr.3 - 2.0, theme::border());
+    stroke_round(g, boxr, ctrl_radius(), theme::border());
+    let vx = boxr.0 + bw + (vw - g.measure_chrome_text(value, 12.0, false)) / 2.0;
+    draw_text(g, vx, boxr.1 + 6.5, value, 12.0, theme::text(), false);
+    *y += ROW_H;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn text_field(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    caret_out: &mut Option<Rect>,
+    x: f32,
+    y: f32,
+    w: f32,
+    label: &str,
+    value: &str,
+    field: SettingsInput,
+    caret: usize,
+    multiline: bool,
+) {
+    // 목업(플랫): 한 줄 입력은 이름 왼쪽·칸 오른쪽의 한 행. 여러 줄은 이름 위, 칸 아래.
+    let rect = if multiline {
+        if !label.is_empty() {
+            draw_text(g, x, y, label, 12.0, theme::text_dim(), false);
+        }
+        let top = y + if label.is_empty() { 0.0 } else { 20.0 };
+        (x, top, w, 132.0)
+    } else if label.is_empty() {
+        (x, y, w, CTL_H)
+    } else {
+        let fw = (w * 0.45).max(160.0).min(w);
+        flat_row(g, x, y, w, label, "", w - fw - 12.0);
+        (x + w - fw, y + (ROW_H - CTL_H) / 2.0, fw, CTL_H)
+    };
+    let focused = s.input == Some(field);
+    round_rect(
+        g,
+        rect.0,
+        rect.1,
+        rect.2,
+        rect.3,
+        ctrl_radius(),
+        if focused {
+            theme::surface_hover()
+        } else {
+            theme::surface()
+        },
+    );
+    if focused {
+        stroke_round(g, rect, ctrl_radius(), theme::accent());
+        if s.select_all {
+            g.rect(
+                rect.0 + 3.0,
+                rect.1 + 3.0,
+                rect.2 - 6.0,
+                rect.3 - 6.0,
+                theme::with_alpha(theme::accent(), 42),
+            );
+        }
+    } else {
+        stroke_round(g, rect, ctrl_radius(), theme::border());
+    }
+    register_clipped(g, hits, Target::Focus(field), rect, HitCursor::Text);
+    g.push_clip(rect.0 + 10.0, rect.1 + 5.0, rect.2 - 20.0, rect.3 - 10.0);
+    if multiline {
+        let lines = wrap_text(g, value, rect.2 - 22.0, 12.0);
+        let caret_line = lines
+            .iter()
+            .position(|(line, start)| caret >= *start && caret <= start + line.chars().count())
+            .unwrap_or_else(|| lines.len().saturating_sub(1));
+        let visible_lines = ((rect.3 - 20.0) / 18.0).floor().max(1.0) as usize;
+        let first_line = multiline_first_line(caret_line, visible_lines, focused);
+        let rows = lines
+            .iter()
+            .map(|(line, start)| {
+                let mut caret_xs = Vec::with_capacity(line.chars().count() + 1);
+                caret_xs.push(0.0);
+                let mut prefix = String::new();
+                for ch in line.chars() {
+                    prefix.push(ch);
+                    caret_xs.push(g.measure_chrome_text(&prefix, 12.0, false));
+                }
+                VisualRow {
+                    start: *start,
+                    len: line.chars().count(),
+                    caret_xs,
+                }
+            })
+            .collect();
+        push_multiline_layout(MultilineLayout {
+            field,
+            rect,
+            rows,
+            first_line,
+            visible_lines,
+        });
+        let mut caret_xy = (rect.0 + 11.0, rect.1 + 10.0);
+        for (i, (line, start)) in lines
+            .iter()
+            .skip(first_line)
+            .take(visible_lines)
+            .enumerate()
+        {
+            let ly = rect.1 + 10.0 + i as f32 * 18.0;
+            draw_text(g, rect.0 + 11.0, ly, line, 12.0, theme::text(), false);
+            let end = start + line.chars().count();
+            if caret >= *start && caret <= end {
+                let prefix: String = line.chars().take(caret - start).collect();
+                caret_xy = (
+                    rect.0 + 11.0 + g.measure_chrome_text(&prefix, 12.0, false),
+                    ly,
+                );
+            }
+        }
+        if focused {
+            draw_preedit_and_caret(g, s, caret_xy, 17.0, caret_out);
+        }
+    } else {
+        let (shown, visible_start) = if value.is_empty() {
+            ("입력하세요".to_string(), 0)
+        } else if focused {
+            single_line_window(g, value, caret, rect.2 - 22.0, 12.0)
+        } else {
+            (fit(g, value, rect.2 - 22.0, 12.0, false), 0)
+        };
+        draw_text(
+            g,
+            rect.0 + 11.0,
+            rect.1 + 6.5,
+            &shown,
+            12.0,
+            if value.is_empty() {
+                theme::text_dim()
+            } else {
+                theme::text()
+            },
+            false,
+        );
+        if focused {
+            let prefix: String = value
+                .chars()
+                .skip(visible_start)
+                .take(caret.saturating_sub(visible_start).min(value.chars().count()))
+                .collect();
+            let cx = rect.0 + 11.0 + g.measure_chrome_text(&prefix, 12.0, false);
+            draw_preedit_and_caret(g, s, (cx, rect.1 + 5.0), 16.0, caret_out);
+        }
+    }
+    g.pop_clip();
+}
+
+fn single_line_window(
+    g: &mut gpu::GpuRenderer,
+    text: &str,
+    caret: usize,
+    width: f32,
+    font: f32,
+) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let caret = caret.min(chars.len());
+    let mut start = caret;
+    while start > 0 {
+        let candidate: String = chars[start - 1..caret].iter().collect();
+        if g.measure_chrome_text(&candidate, font, false) > width * 0.72 {
+            break;
+        }
+        start -= 1;
+    }
+    let mut end = caret;
+    while end < chars.len() {
+        let candidate: String = chars[start..=end].iter().collect();
+        if g.measure_chrome_text(&candidate, font, false) > width {
+            break;
+        }
+        end += 1;
+    }
+    (chars[start..end].iter().collect(), start)
+}
+
+fn draw_preedit_and_caret(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    pos: (f32, f32),
+    h: f32,
+    caret_out: &mut Option<Rect>,
+) {
+    if !s.preedit.is_empty() {
+        draw_text(g, pos.0, pos.1, &s.preedit, 12.0, theme::text(), false);
+        let width = g.measure_chrome_text(&s.preedit, 12.0, false).max(7.0);
+        g.rect(pos.0, pos.1 + h - 2.0, width, 1.0, theme::accent());
+    } else if s.caret_on {
+        g.rect(pos.0, pos.1, 1.5, h, theme::cursor());
+    }
+    *caret_out = Some((pos.0, pos.1, 2.0, h));
+}
+
+/// 안내문을 낱말 경계에서 접는다. `wrap_text` 는 글자 단위라 편집 중인 입력에는
+/// 맞지만, 읽기만 하는 안내문에 쓰면 「넷버드(VP / N)」처럼 낱말 가운데가 갈린다.
+fn wrap_words(g: &mut gpu::GpuRenderer, text: &str, max_w: f32, font: f32) -> Vec<String> {
+    let translated = crate::native_strings::text(text);
+    wrap_measured(&translated, max_w, |line| g.measure_chrome_text(line, font, false))
+}
+
+fn wrap_measured(text: &str, max_w: f32, mut measure: impl FnMut(&str) -> f32) -> Vec<String> {
+    if max_w <= 0.0 { return Vec::new(); }
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for paragraph in text.split('\n') {
+        for word in paragraph.split_whitespace() {
+            let next = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+            if measure(&next) <= max_w {
+                line = next;
+                continue;
+            }
+            if !line.is_empty() { out.push(std::mem::take(&mut line)); }
+            // URLs and CJK prose have no spaces to break on.
+            for ch in word.chars() {
+                let next = format!("{line}{ch}");
+                if !line.is_empty() && measure(&next) > max_w {
+                    out.push(std::mem::take(&mut line));
+                }
+                if measure(&ch.to_string()) <= max_w { line.push(ch); }
+            }
+        }
+        if !line.is_empty() { out.push(std::mem::take(&mut line)); }
+    }
+    out
+}
+
+fn wrap_text(g: &mut gpu::GpuRenderer, text: &str, max_w: f32, font: f32) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut start = 0usize;
+    for (index, ch) in text.chars().enumerate() {
+        if ch == '\n' {
+            out.push((std::mem::take(&mut line), start));
+            start = index + 1;
+            continue;
+        }
+        let next = format!("{line}{ch}");
+        if !line.is_empty() && g.measure_chrome_text(&next, font, false) > max_w {
+            out.push((std::mem::take(&mut line), start));
+            start = index;
+        }
+        line.push(ch);
+    }
+    out.push((line, start));
+    out
+}
+
+/// 설정 부품의 모서리. 워프 기준(버튼·입력창·팝업 5px, 칩 3px, 분절 상자 바깥 4px/안 3px)
+/// 을 상한으로 두고, 테마 모양(Rounded/Sharp/Pixel)이 그보다 작으면 그걸 따른다 —
+/// Pixel 은 0 그대로다.
+fn ctrl_radius() -> f32 {
+    theme::radius_md().min(5.0)
+}
+
+fn chip_radius() -> f32 {
+    theme::radius_sm().min(3.0)
+}
+
+fn seg_outer_radius() -> f32 {
+    theme::radius_sm().min(4.0)
+}
+
+fn seg_inner_radius() -> f32 {
+    theme::radius_sm().min(3.0)
+}
+
+fn choice_card(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    rect: Rect,
+    selected: bool,
+    target: Target,
+) {
+    choice_card_with_radius(g, s, hits, rect, selected, target, ctrl_radius());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choice_card_with_radius(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    rect: Rect,
+    selected: bool,
+    target: Target,
+    r: f32,
+) {
+    // 목업(플랫): 채움 없이 테두리만. 고른 것은 강조색, 올리면 한 톤 진한 회색.
+    let hover = contains(rect, s.cursor);
+    stroke_round(
+        g,
+        rect,
+        r,
+        if selected {
+            theme::accent()
+        } else if hover {
+            theme::text_dim()
+        } else {
+            theme::border()
+        },
+    );
+    register_clipped(g, hits, target, rect, HitCursor::Pointer);
+    g.hover_pointer |= hover;
+}
+
+fn button(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    rect: Rect,
+    label: &str,
+    target: Target,
+    primary: bool,
+) {
+    let hover = contains(rect, s.cursor);
+    // 주 버튼은 강조색 그대로이고 호버에 한 톤만 밝아진다 — 예전엔 호버 순간
+    // 회색 `surface_active` 로 바뀌어 눌리는 게 아니라 꺼지는 것처럼 보였다.
+    // 보조 버튼은 입력칸·카드와 같은 채움+테두리 한 벌이라 한 화면 안에서
+    // 마감이 하나로 읽힌다(2026-09-10 지적 「버튼 마감이 이상하다」).
+    // 호출처가 준 높이가 30~36 으로 제각각이라, 보이는 몸통만 30 으로 맞추고
+    // 세로로 가운데 놓는다(누르는 자리는 준 사각형 그대로). 워프 버튼 높이.
+    // 목업(플랫, 2026-09-10 「버튼 아웃라인, 텍스트만 색 바꿔서. fill 은 x」):
+    // 채움 없이 테두리와 글자만. 보조는 회색→올리면 진해지고, 주 버튼은 강조색.
+    let vis = if rect.3 > CTL_H {
+        (rect.0, rect.1 + ((rect.3 - CTL_H) / 2.0).floor(), rect.2, CTL_H)
+    } else {
+        rect
+    };
+    let (line, ink) = if primary {
+        (theme::accent(), theme::accent())
+    } else if hover {
+        (theme::text_dim(), theme::text())
+    } else {
+        (theme::border(), theme::text_dim())
+    };
+    stroke_round(g, vis, ctrl_radius(), line);
+    let shown = fit(g, label, vis.2 - 20.0, 12.0, primary);
+    let tx = vis.0 + (vis.2 - g.measure_chrome_text(&shown, 12.0, primary)) / 2.0;
+    draw_text(
+        g,
+        tx,
+        vis.1 + (vis.3 - 12.0) / 2.0 - 0.5,
+        &shown,
+        12.0,
+        ink,
+        primary,
+    );
+    register_clipped(g, hits, target, rect, HitCursor::Pointer);
+    g.hover_pointer |= hover;
+}
+
+fn mini_icon_button(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    rect: Rect,
+    icon: &str,
+    target: Target,
+) {
+    let hover = contains(rect, s.cursor);
+    if hover {
+        round_rect(
+            g,
+            rect.0,
+            rect.1,
+            rect.2,
+            rect.3,
+            chip_radius(),
+            theme::surface_active(),
+        );
+    }
+    g.queue_icon(
+        icon,
+        rect.0 + 6.0,
+        rect.1 + 6.0,
+        14.0,
+        if hover {
+            theme::text()
+        } else {
+            theme::text_mute()
+        },
+    );
+    register_clipped(g, hits, target, rect, HitCursor::Pointer);
+}
+
+/// 이름 옆에 붙는 알약. 상태를 한 낱말로 못박아 두면 어느 줄이 지금 쓰이는
+/// 것인지 카드 테두리 색을 해석하지 않고도 읽힌다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmailProviderMark {
+    Gmail,
+    Naver,
+    Generic,
+}
+
+fn email_provider(email: &str) -> EmailProviderMark {
+    match email
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("gmail.com" | "googlemail.com") => EmailProviderMark::Gmail,
+        Some("naver.com") => EmailProviderMark::Naver,
+        _ => EmailProviderMark::Generic,
+    }
+}
+
+/// 이메일 앞에는 서비스가 제공한 공식 표지만 쓴다. 모르는 도메인을 임의 색과
+/// 첫 글자로 꾸미면 실제 브랜드처럼 보이므로, 그때는 정직한 일반 메일 아이콘으로
+/// 물러난다.
+fn email_provider_mark(
+    g: &mut gpu::GpuRenderer,
+    x: f32,
+    y: f32,
+    email: &str,
+    size: f32,
+) -> f32 {
+    match email_provider(email) {
+        EmailProviderMark::Gmail => {
+            g.queue_icon_colored("gmail", x, y, size, 1.0);
+            size
+        }
+        EmailProviderMark::Naver => {
+            // 공식 NAVER 워드마크는 2315:444다. 정사각형 칸에 구기지 않고
+            // 원래 비율 그대로, 부제 글자 높이에 맞춘다.
+            let h = 8.0;
+            let w = h * 2315.0 / 444.0;
+            g.queue_icon_colored_rect("naver", x, y + (size - h) / 2.0, w, h, 1.0);
+            w
+        }
+        EmailProviderMark::Generic => {
+            g.queue_icon("mail", x, y, size, theme::text_mute());
+            size
+        }
+    }
+}
+
+fn pill(g: &mut gpu::GpuRenderer, x: f32, y: f32, text: &str, accent: bool) -> f32 {
+    let f = 9.5;
+    let w = g.measure_chrome_text(text, f, false) + 14.0;
+    // 목업(플랫): 알약도 채움 없이 테두리와 글자만.
+    stroke_round(
+        g,
+        (x, y, w, 17.0),
+        8.5,
+        if accent { theme::accent() } else { theme::border() },
+    );
+    draw_text(
+        g,
+        x + 7.0,
+        y + 4.0,
+        text,
+        f,
+        if accent {
+            theme::accent()
+        } else {
+            theme::text_mute()
+        },
+        false,
+    );
+    w
+}
+
+/// 아이콘만 있는 단추는 뜻을 모른 채 나란히 서면 누르기가 무섭다 — 계정 줄처럼
+/// 되돌리기 어려운 것이 섞인 자리에서는 글자를 함께 세운다. 폭을 돌려주므로
+/// 오른쪽 끝에서부터 거꾸로 쌓을 수 있다.
+#[allow(clippy::too_many_arguments)]
+fn mini_text_button(
+    g: &mut gpu::GpuRenderer,
+    s: &Snapshot,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: f32,
+    icon: &str,
+    label: &str,
+    target: Target,
+    danger: bool,
+) -> f32 {
+    let f = 10.5;
+    let w = g.measure_chrome_text(label, f, false) + 32.0;
+    let rect = (x, y, w, 26.0);
+    let hover = contains(rect, s.cursor);
+    if hover {
+        round_rect(
+            g,
+            rect.0,
+            rect.1,
+            rect.2,
+            rect.3,
+            chip_radius(),
+            theme::surface_active(),
+        );
+    }
+    let col = if hover {
+        if danger {
+            theme::danger()
+        } else {
+            theme::text()
+        }
+    } else {
+        theme::text_mute()
+    };
+    g.queue_icon(icon, x + 8.0, y + 6.5, 13.0, col);
+    draw_text(g, x + 25.0, y + 7.0, label, f, col, false);
+    register_clipped(g, hits, target, rect, HitCursor::Pointer);
+    g.hover_pointer |= hover;
+    w
+}
+
+/// 둥근 채움 위에 두르는 1px 테두리 — 반지름을 채움과 같게 주면 모서리가 채움
+/// 안에 머문다. 직각 `stroke_rect` 는 사각 격자(SV 판·색상띠)에만 남긴다.
+fn stroke_round(g: &mut gpu::GpuRenderer, rect: Rect, r: f32, color: [u8; 4]) {
+    g.round_rect_stroke(rect.0, rect.1, rect.2, rect.3, r, theme::border_w().max(1.0), color);
+}
+
+fn stroke_rect(g: &mut gpu::GpuRenderer, rect: Rect, color: [u8; 4]) {
+    g.rect(rect.0, rect.1, rect.2, 1.0, color);
+    g.rect(rect.0, rect.1 + rect.3 - 1.0, rect.2, 1.0, color);
+    g.rect(rect.0, rect.1, 1.0, rect.3, color);
+    g.rect(rect.0 + rect.2 - 1.0, rect.1, 1.0, rect.3, color);
+}
+
+fn register(hits: &mut Vec<Hit>, target: Target, rect: Rect, cursor: HitCursor) {
+    hits.push(Hit {
+        target,
+        rect,
+        cursor,
+    });
+}
+
+fn register_clipped(
+    g: &gpu::GpuRenderer,
+    hits: &mut Vec<Hit>,
+    target: Target,
+    rect: Rect,
+    cursor: HitCursor,
+) {
+    if let Some(rect) = g.clip_hit(rect) {
+        register(hits, target, rect, cursor);
+    }
+}
+
+fn contains(rect: Rect, point: (f32, f32)) -> bool {
+    point.0 >= rect.0
+        && point.0 <= rect.0 + rect.2
+        && point.1 >= rect.1
+        && point.1 <= rect.1 + rect.3
+}
+
+fn draw_text(
+    g: &mut gpu::GpuRenderer,
+    x: f32,
+    y: f32,
+    text: &str,
+    size: f32,
+    color: [u8; 4],
+    bold: bool,
+) {
+    let text = crate::native_strings::text(text);
+    g.draw_text(
+        x,
+        y,
+        &text,
+        gpu::DrawOpts {
+            font_size: size,
+            color,
+            bold,
+            italic: false,
+        },
+    );
+}
+
+fn fit(g: &mut gpu::GpuRenderer, text: &str, width: f32, font: f32, bold: bool) -> String {
+    let translated = crate::native_strings::text(text);
+    let text = translated.as_ref();
+    if g.measure_chrome_text(text, font, bold) <= width {
+        return text.to_string();
+    }
+    if width <= 0.0 || g.measure_chrome_text("…", font, bold) > width {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let candidate = format!("{out}{ch}…");
+        if g.measure_chrome_text(&candidate, font, bold) > width {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+fn color_for_word(word: &str) -> [u8; 4] {
+    let mut hash = 0u32;
+    for byte in word.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
+    }
+    let accent = theme::accent();
+    [
+        accent[0].saturating_add((hash & 31) as u8),
+        accent[1].saturating_sub(((hash >> 5) & 23) as u8),
+        accent[2].saturating_add(((hash >> 10) & 17) as u8),
+        255,
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 넓은 창에서 남는 폭은 좌우로 똑같이 갈라져야 한다. 고치기 전에는 열이
+    /// nav 바로 옆에 못박혀 남는 폭이 전부 오른쪽에 쌓였다(2560 창 기준 1026px).
+    #[test]
+    fn content_column_centers_the_surplus_on_wide_windows() {
+        let nav = 200.0;
+        let (x, w) = content_column(0.0, 2360.0, nav);
+        assert_eq!(w, CONTENT_MAX_W, "열은 상한에서 자라기를 멈춘다");
+        let left = x - nav;
+        let right = 2360.0 - (x + w);
+        assert!(
+            (left - right).abs() <= 1.0,
+            "좌여백 {left} 과 우여백 {right} 이 갈라지지 않았다"
+        );
+    }
+
+    /// 열이 남는 폭을 다 쓰는 좁은 창은 나눌 것이 없다 — 예전 배치 그대로 gutter 하나.
+    #[test]
+    fn content_column_keeps_the_old_gutter_when_there_is_no_surplus() {
+        let nav = 200.0;
+        for (aw, gutter) in [(700.0, 20.0), (1000.0, 28.0)] {
+            let (x, w) = content_column(0.0, aw, nav);
+            assert_eq!(x, nav + gutter, "aw={aw} 에서 열이 밀렸다");
+            assert!(w < CONTENT_MAX_W, "aw={aw} 는 상한에 닿지 않는 폭이어야 한다");
+        }
+    }
+
+    #[test]
+    fn wrap_measured_keeps_long_unspaced_text_inside_available_width() {
+        for width in [1.0, 4.0, 12.0, 80.0] {
+            for input in ["긴기계이름과공백없는설명입니다", "https://example.invalid/very/long/path", "account one failed\nplease retry"] {
+                let lines = wrap_measured(input, width, |line| line.chars().count() as f32);
+                assert!(lines.iter().all(|line| line.chars().count() as f32 <= width));
+                let actual: String = lines.join("").chars().filter(|ch| !ch.is_whitespace()).collect();
+                let expected: String = input.chars().filter(|ch| !ch.is_whitespace()).collect();
+                assert_eq!(actual, expected);
+            }
+        }
+        assert!(wrap_measured("text", 0.0, |_| 4.0).is_empty());
+        assert_eq!(wrap_measured("two words\nnext", 20.0, |line| line.len() as f32), vec!["two words", "next"]);
+    }
+
+    fn usage_account(windows: Vec<crate::UsageWindowBadge>) -> AccountChoice {
+        let usage_windows = windows.clone();
+        AccountChoice {
+            email: String::new(),
+            provider: AccountProvider::Claude,
+            id: "acct-1".to_string(),
+            name: "업무".to_string(),
+            sub: String::new(),
+            sub_kind: "mute",
+            active: true,
+            slot: true,
+            usage: Some(crate::UsageBadge {
+                pct: 70.0,
+                label: "7d".to_string(),
+                stale: false,
+                account_dir: "acct-1".to_string(),
+                resets_at: None,
+                windows,
+            }),
+            usage_windows,
+            usage_state: AccountUsageState::Ready,
+        }
+    }
+
+    #[test]
+    fn email_marks_use_real_brands_only_for_known_services() {
+        assert_eq!(email_provider("me@gmail.com"), EmailProviderMark::Gmail);
+        assert_eq!(
+            email_provider("me@googlemail.com"),
+            EmailProviderMark::Gmail
+        );
+        assert_eq!(email_provider("me@naver.com"), EmailProviderMark::Naver);
+        assert_eq!(email_provider("me@example.com"), EmailProviderMark::Generic);
+        assert_eq!(email_provider("not-an-email"), EmailProviderMark::Generic);
+    }
+
+    #[test]
+    fn usage_states_keep_loading_failure_and_logout_distinct() {
+        assert_eq!(
+            account_usage_state(Some(true), false, None),
+            AccountUsageState::Loading
+        );
+        assert_eq!(
+            account_usage_state(Some(true), false, Some(false)),
+            AccountUsageState::Failed
+        );
+        assert_eq!(
+            account_usage_state(Some(true), true, Some(false)),
+            AccountUsageState::Failed
+        );
+        assert_eq!(
+            account_usage_state(Some(false), true, Some(true)),
+            AccountUsageState::LoggedOut,
+            "로그아웃이 옛 캐시보다 우선해야 한다"
+        );
+    }
+
+    #[test]
+    fn previous_usage_is_never_presented_as_current_or_logged_in() {
+        let mut row = usage_account(vec![]);
+        row.usage.as_mut().unwrap().pct = 42.0;
+        row.usage_state = AccountUsageState::Failed;
+        assert_eq!(account_usage_summary(&row), ("이전 42% · 조회 실패".into(), None));
+        row.usage_state = AccountUsageState::LoggedOut;
+        assert_eq!(account_usage_summary(&row), ("로그인 후 사용량을 볼 수 있어요".into(), None));
+        row.usage_state = AccountUsageState::Ready;
+        row.usage.as_mut().unwrap().stale = true;
+        assert_eq!(account_usage_summary(&row), ("이전 42%".into(), None));
+    }
+
+    #[test]
+    fn account_details_keep_each_window_reset_and_wrap_models_after_core_windows() {
+        let row = usage_account(vec![
+            crate::UsageWindowBadge {
+                label: "5h".to_string(),
+                pct: 12.0,
+                resets_at: None,
+            },
+            crate::UsageWindowBadge {
+                label: "7d".to_string(),
+                pct: 70.0,
+                resets_at: Some(200),
+            },
+            crate::UsageWindowBadge {
+                label: "7d Fable".to_string(),
+                pct: 41.0,
+                resets_at: Some(300),
+            },
+        ]);
+        let lines = account_usage_lines(&row);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].label, "5시간");
+        assert_eq!(lines[0].resets_at, None, "5h에 없는 reset을 7d에서 빌리면 안 된다");
+        assert_eq!(lines[1].label, "7일");
+        assert_eq!(lines[1].resets_at, Some(200));
+        assert_eq!(lines[2].label, "Fable · 7일");
+        assert_eq!(lines[2].resets_at, Some(300));
+        assert_ne!(
+            account_usage_key(AccountProvider::Claude, "acct-1"),
+            account_usage_key(AccountProvider::Codex, "acct-1")
+        );
+    }
+
+    #[test]
+    fn cursor_cards_cover_every_persisted_shape_once() {
+        let all = cursor::CursorShape::ALL;
+        assert_eq!(all.len(), 8);
+        for shape in all {
+            assert!(cursor::CursorShape::from_str(shape.as_str()).is_some());
+        }
+    }
+
+    #[test]
+    fn settings_hit_uses_visible_rect_only() {
+        let hit = Hit {
+            target: Target::Close,
+            rect: (10.0, 20.0, 30.0, 40.0),
+            cursor: HitCursor::Pointer,
+        };
+        assert!(contains(hit.rect, (40.0, 60.0)));
+        assert!(!contains(hit.rect, (40.1, 60.1)));
+    }
+
+    #[test]
+    fn multiline_classification_stays_narrow() {
+        assert!(is_multiline(SettingsInput::StudentPersona));
+        assert!(is_multiline(SettingsInput::StudentRaw));
+        assert!(is_multiline(SettingsInput::FeedbackBody));
+        assert!(!is_multiline(SettingsInput::CwdPath));
+    }
+
+    #[test]
+    fn student_model_and_roster_actions_refresh_the_cached_selection() {
+        assert!(action_refreshes_cache(&SettingsAction::StudentModel(
+            "model".to_string(),
+            "backend".to_string(),
+        )));
+        assert!(action_refreshes_cache(&SettingsAction::SelectTheme(
+            "theme".to_string(),
+        )));
+        assert!(!action_refreshes_cache(&SettingsAction::CursorShape(
+            cursor::CursorShape::Frame,
+        )));
+    }
+
+    #[test]
+    fn mixed_character_choices_keep_their_selection_across_active_themes() {
+        use std::collections::HashMap;
+        let rosters: HashMap<_, _> = [("a", vec!["Alice", "Shared"]), ("b", vec!["Bob", "Shared"])]
+            .into_iter().map(|(theme, names)| (theme.to_string(), names.into_iter()
+                .map(|name| CharacterChoice { name: name.into(), slug: name.into() }).collect())).collect();
+        let selected = vec![("b".into(), vec!["Bob".into(), "Shared".into()]), ("a".into(), vec!["Alice".into(), "Shared".into()])];
+        for active in ["a", "b", ""] {
+            assert!(character_choice_selected_from(&selected, &rosters, active, "a", "Alice"));
+            assert!(character_choice_selected_from(&selected, &rosters, active, "b", "Bob"));
+            assert!(!character_choice_selected_from(&selected, &rosters, active, "a", "Shared"));
+            assert!(character_choice_selected_from(&selected, &rosters, active, "b", "Shared"));
+        }
+        assert!(character_choice_selected_from(&[], &rosters, "b", "b", "Bob"));
+        assert!(!character_choice_selected_from(&[], &rosters, "b", "a", "Alice"));
+    }
+
+    #[test]
+    fn ordinary_settings_actions_never_trigger_full_media_decode() {
+        for action in [
+            SettingsAction::UiLanguage("en"),
+            SettingsAction::Accent("blue".to_string()),
+            SettingsAction::StudentModel("model".to_string(), String::new()),
+            SettingsAction::ToggleFeedbackDiag,
+            SettingsAction::AccountAutoswitchPct(85),
+        ] {
+            assert!(!action_refreshes_media(&action));
+        }
+        assert!(!remote_action_refreshes_media("set-language"));
+        assert!(!remote_action_refreshes_media("palette-hex"));
+        assert!(action_refreshes_media(&SettingsAction::RefreshStudentAssets));
+        assert!(remote_action_refreshes_media("refresh-assets"));
+    }
+
+    #[test]
+    fn direct_shell_field_never_appends_to_a_preset() {
+        assert_eq!(direct_shell_seed("/bin/zsh", false), "");
+        assert_eq!(direct_shell_seed("/bin/bash", false), "");
+        assert_eq!(direct_shell_seed("", false), "");
+        assert_eq!(direct_shell_seed("C:\\Windows\\System32\\cmd.exe", true), "");
+        assert_eq!(
+            direct_shell_seed("/opt/homebrew/bin/fish", false),
+            "/opt/homebrew/bin/fish"
+        );
+    }
+
+    #[test]
+    fn multiline_view_keeps_a_deep_caret_inside_the_field() {
+        assert_eq!(multiline_first_line(14, 6, true), 9);
+        assert_eq!(multiline_first_line(2, 6, true), 0);
+        assert_eq!(multiline_first_line(14, 6, false), 0);
+    }
+
+    #[test]
+    fn multiline_click_rows_and_vertical_motion_use_global_character_indices() {
+        let layout = MultilineLayout {
+            field: SettingsInput::StudentPersona,
+            rect: (100.0, 200.0, 300.0, 132.0),
+            rows: vec![
+                VisualRow {
+                    start: 0,
+                    len: 2,
+                    // 실제 shaper가 잰 한글 두 글자 폭처럼 균등하지 않은 좌표.
+                    caret_xs: vec![0.0, 13.0, 27.0],
+                },
+                VisualRow {
+                    start: 3,
+                    len: 3,
+                    caret_xs: vec![0.0, 7.0, 15.0, 22.0],
+                },
+            ],
+            first_line: 0,
+            visible_lines: 6,
+        };
+        assert_eq!(multiline_caret_from_point(&layout, (126.0, 228.0)), 5);
+        assert_eq!(move_multiline_caret(&layout, 1, true), 5);
+        assert_eq!(move_multiline_caret(&layout, 5, false), 1);
+    }
+
+    #[test]
+    fn main_modals_own_pointer_and_click_before_the_settings_view() {
+        let handler = include_str!("handler.rs");
+        let cursor = handler
+            .split_once("WindowEvent::CursorMoved { position, .. } => {")
+            .unwrap()
+            .1;
+        assert!(
+            cursor.find("let main_modal").unwrap()
+                < cursor.find("native_settings_contains").unwrap()
+        );
+
+        let mouse = handler
+            .split_once("button: MouseButton::Left,\n                ..\n            } => {")
+            .unwrap()
+            .1;
+        let native = mouse.find("native_settings_contains").unwrap();
+        assert!(mouse.find("self.confirm_close.is_some()").unwrap() < native);
+        assert!(mouse.find("self.restore_prompt.is_some()").unwrap() < native);
+        assert!(mouse.find("self.account_switch_confirm").unwrap() < native);
+        assert!(mouse.find("self.git.commit_modal_open").unwrap() < native);
+    }
+
+    #[test]
+    fn painter_never_reaches_file_or_network_io() {
+        let source = include_str!("native_settings.rs");
+        let snapshot = &source[source
+            .find("pub(crate) fn native_settings_snapshot")
+            .unwrap()
+            ..source
+                .find("pub(crate) fn finish_native_settings_paint")
+                .unwrap()];
+        let paint = &source
+            [source.find("pub(crate) fn paint(").unwrap()..source.find("#[cfg(test)]").unwrap()];
+        for forbidden in [
+            "read_settings(",
+            "characters_json(",
+            "theme_rows(",
+            "std::fs::",
+            "TcpStream",
+        ] {
+            assert!(
+                !snapshot.contains(forbidden) && !paint.contains(forbidden),
+                "렌더 경로에 I/O가 들어왔다: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_settings_keeps_every_web_settings_feature_reachable() {
+        let native = include_str!("native_settings.rs");
+        let web = [
+            include_str!("../../../web/arona-ui/src/settings/GeneralTab.tsx"),
+            include_str!("../../../web/arona-ui/src/settings/lang.tsx"),
+            include_str!("../../../web/arona-ui/src/settings/AppearanceTab.tsx"),
+            include_str!("../../../web/arona-ui/src/settings/ShellTab.tsx"),
+            include_str!("../../../web/arona-ui/src/settings/ClaudeTab.tsx"),
+            include_str!("../../../web/arona-ui/src/settings/ThemeTab.tsx"),
+            include_str!("../../../web/arona-ui/src/settings/CharacterDetail.tsx"),
+            include_str!("../../../web/arona-ui/src/settings/ThemeGen.tsx"),
+            include_str!("../../../web/arona-ui/src/settings/MotionSprites.tsx"),
+            include_str!("../../../web/arona-ui/src/settings/FeedbackTab.tsx"),
+        ]
+        .join("\n");
+        for (feature, web_needle, native_needle) in [
+            ("language", "set-language", "UiLanguage"),
+            ("system theme slots", "theme-system-${slot}", "ThemeSystemSlot"),
+            ("custom palette rename", "rename-custom-theme", "FocusCustomThemeLabel"),
+            ("palette wheel", "ColorWheel", "PickerSV"),
+            ("eyedropper", "palette-eyedropper", "PaletteEyedropper"),
+            ("isolated reauth", "reauth-account-isolated", "LoginBrowser::Isolated"),
+            ("account label", "account-label", "FocusAccountLabel"),
+            ("theme roster", "theme-pick-all", "ThemePickAll"),
+            ("raw character", "rawSave", "SaveStudentRaw"),
+            ("theme generation", "theme-gen-start", "ThemeGenStart"),
+            ("motion frames", "character-sprite", "SelectMotionFrame"),
+            ("feedback draft", "feedback-draft", "feedback_draft"),
+        ] {
+            assert!(web.contains(web_needle), "web lost {feature}: {web_needle}");
+            assert!(native.contains(native_needle), "native lost {feature}: {native_needle}");
+        }
+    }
+
+    #[test]
+    fn parity_settings_bundle_roundtrips_through_an_isolated_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "kasaterm-settings-parity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("settings.json");
+        let value = serde_json::json!({
+            "language": "en",
+            "file_open_mode": "terminal",
+            "file_open_app": "",
+            "file_open_cmd": "code --goto {path}:{line}",
+            "editor_autosave_ms": 10000,
+            "theme_system_light": "light",
+            "theme_system_dark": "custom:night",
+            "claude_account_autoswitch_pct": 85,
+            "feedback_draft": "쓰다 만 초안",
+            "theme_gen_provider": "nanobanana"
+        });
+        socket::write_settings_value_atomic_at(&path, &value).unwrap();
+        let roundtrip: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(roundtrip, value);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropped_images_are_bounded_before_their_bytes_are_allocated() {
+        let dir = std::env::temp_dir().join(format!("kasaterm-drop-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large.png");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(SPRITE_DROP_MAX_BYTES + 1).unwrap();
+        assert!(drop_size_ok(&path, SPRITE_DROP_MAX_BYTES).is_err());
+        assert!(drop_size_ok(&path, THEMEGEN_DROP_MAX_BYTES).is_ok());
+        drop(file);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn palette_preview_marks_the_field_dirty_and_commit_refreshes_visible_cache() {
+        let source = include_str!("native_settings.rs");
+        let click = source
+            .split_once("pub(crate) fn native_settings_click")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn native_settings_drag_move")
+            .unwrap()
+            .0;
+        assert!(click.find("mark_field_dirty").unwrap() < click.find("picker_preview").unwrap());
+        let settings = include_str!("settings.rs");
+        let apply = settings
+            .split_once("pub(crate) fn apply_palette_edit")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn preview_palette_edit")
+            .unwrap()
+            .0;
+        assert!(apply.find("refresh_palette_cache").unwrap() < apply.find("repaint_all").unwrap());
+    }
+
+    #[test]
+    fn remote_student_open_preserves_the_theme_context() {
+        let handler = include_str!("handler.rs");
+        let open = handler
+            .split_once("\"open-student\" =>")
+            .unwrap()
+            .1
+            .split_once("\"select-theme\"")
+            .unwrap()
+            .0;
+        assert!(open.contains("label.clone().unwrap_or_default()"));
+        assert!(open.contains("SelectStudentInTheme(theme, arg.clone())"));
+    }
+
+    /// 스크롤바는 스크롤되는 영역의 오른쪽에 붙어야 한다. 글자가 앉는 칼럼
+    /// (`content_x`/`content_w`)을 그대로 주면 그 좌우 여백만큼 안으로 들어와,
+    /// 막대가 패널 가장자리에서 떨어진 허공에 뜬다(2026-09-05 지적 · 실측 58px).
+    /// 설정과 보드가 같은 자리에서 같은 실수를 했으므로 둘 다 지킨다.
+    #[test]
+    fn the_scrollbar_hugs_the_panel_edge_not_the_text_column() {
+        for (label, source) in [
+            ("설정", include_str!("native_settings.rs")),
+            ("보드", include_str!("native_board.rs")),
+        ] {
+            assert!(
+                source.contains("paint_scroll_affordance(\n        g,\n        scroll_x,"),
+                "{label} 스크롤바가 글자 칼럼 기준이면 패널 가장자리에서 떨어져 뜬다"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_renderer_uses_cached_visual_feedback_for_every_character_surface() {
+        let source = include_str!("native_settings.rs");
+        for call in [".draw_face(", ".draw_reference(", ".draw_motion_frame(", ".draw_motion_preview("] {
+            assert!(source.contains(call), "missing media integration: {call}");
+        }
+        let handler = include_str!("handler.rs");
+        assert!(handler.contains("self.settings_media_animating()"));
+        let motion = source
+            .split_once("fn paint_motion_sprites(")
+            .unwrap()
+            .1
+            .split_once("fn paint_themegen_engine(")
+            .unwrap()
+            .0;
+        assert!(motion.find("clip_hit(preview)").unwrap() < motion.find("mark_motion_preview_visible").unwrap());
+        let animating = source
+            .split_once("pub(crate) fn settings_media_animating")
+            .unwrap()
+            .1
+            .split_once("/// 계정 신원")
+            .unwrap()
+            .0;
+        assert!(
+            animating.find("motion_preview_visible").unwrap()
+                < animating.find("next_motion_frame_in").unwrap()
+        );
+        let paint = &source
+            [source.find("pub(crate) fn paint(").unwrap()..source.find("#[cfg(test)]").unwrap()];
+        assert!(!paint.contains("std::fs::"));
+    }
+
+    #[test]
+    fn motion_timer_stays_off_for_raw_tabs_and_offscreen_previews() {
+        assert!(!motion_preview_pump_needed(true, true, false));
+        assert!(!motion_preview_pump_needed(true, false, true));
+        assert!(!motion_preview_pump_needed(false, true, true));
+        assert!(motion_preview_pump_needed(true, true, true));
+    }
+}

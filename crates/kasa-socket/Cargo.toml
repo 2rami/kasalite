@@ -1,0 +1,26 @@
+[package]
+name = "kasa-socket"
+description = "cmux-compatible Unix-socket JSON-RPC server. Speaks the same wire format as cmux's CLI so Claude Code's teammateMode (when it lands) drives kasaterm with no protocol shim."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+# 터미널 가로 칸 수(TIOCGWINSZ)를 읽으려고. 상수도 구조체도 OS 마다 달라 손으로
+# 적으면 한 쪽에서만 맞는 값이 박힌다 — 이미 의존성 트리에 있던 것이라 무거워지지 않는다.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
