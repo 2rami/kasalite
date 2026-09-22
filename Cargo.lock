@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "kasa-bridge"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -2130,7 +2130,7 @@ dependencies = [
 
 [[package]]
 name = "kasa-cells"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2144,11 +2144,11 @@ dependencies = [
 
 [[package]]
 name = "kasa-ime"
-version = "0.2.0"
+version = "0.1.0"
 
 [[package]]
 name = "kasa-mcp"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2177,14 +2177,14 @@ dependencies = [
 
 [[package]]
 name = "kasa-pet-config"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "kasa-pty"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "kasa-socket"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "kasaterm"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",

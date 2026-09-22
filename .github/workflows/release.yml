@@ -1,0 +1,159 @@
+name: Release
+
+# 태그(vX.Y.Z) push 하나로 릴리스: msi(Windows 러너) + dmg(macOS 러너) 를 구워
+# GitHub 릴리스에 첨부한다. 본판 kasaterm 과 달리 appcast 단계가 없다 —
+# KasaLite 는 자동 업데이트를 달지 않은 고정판이라 서명할 피드가 없다.
+#
+# 수동 실행(workflow_dispatch) → 빌드만 하고 artifact 로 올린다. 릴리스도 태그도
+# 건드리지 않으므로, 태그를 밀기 전에 Windows 빌드가 서는지 보는 용도로 쓴다
+# (맥에서는 윈도우 타깃 크로스 컴파일이 ring 의 C 코드에서 막혀 미리 못 본다).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    steps:
+      # 그림 에셋이 git-lfs 라 lfs:true 가 없으면 130바이트 포인터가 내려오고,
+      # build.rs 의 에셋 검사가 거기서 빌드를 세운다(의도된 loud failure).
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build and verify Windows package
+        shell: pwsh
+        run: |
+          # 해시테이블 splatting — 배열로 넘기면 "-ExpectedVersion" 이 이름이 아니라
+          # 첫 위치 인자($Repo)로 들어가 경로 해석에서 선다.
+          $arguments = @{}
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $arguments["ExpectedVersion"] = $env:GITHUB_REF_NAME
+          }
+          & .\scripts\windows\package.ps1 @arguments
+
+      - name: Locate Windows package
+        id: windows_package
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path dist -Filter *-windows-x86_64.msi | Select-Object -First 1
+          if (-not $msi) { throw "Windows package output is missing" }
+          "msi=$($msi.FullName)" >> $env:GITHUB_OUTPUT
+          "msi_hash=$($msi.FullName).sha256" >> $env:GITHUB_OUTPUT
+          Write-Host "built $($msi.Name) ($([math]::Round($msi.Length/1MB,1)) MB)"
+
+      - name: Attach MSI to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.windows_package.outputs.msi }}
+            ${{ steps.windows_package.outputs.msi_hash }}
+          fail_on_unmatched_files: true
+
+      - name: Upload MSI artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kasalite-windows-x86_64
+          path: |
+            ${{ steps.windows_package.outputs.msi }}
+            ${{ steps.windows_package.outputs.msi_hash }}
+
+  build-dmg:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # 태그와 Cargo.toml 버전이 어긋나면 번들 버전이 태그와 다른 판이 나간다.
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          CARGO_VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [[ "v$CARGO_VER" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Cargo.toml version($CARGO_VER) != tag($GITHUB_REF_NAME)"
+            exit 1
+          fi
+
+      # 서명 인증서 secret 이 없으면 build-lite-app.sh 가 ad-hoc 으로 떨어진다.
+      # 라이트는 자동 업데이트가 없어 서명 연속성을 지킬 이유도 없다.
+      - name: Build .app + .dmg
+        run: |
+          bash scripts/build-lite-app.sh
+          VERSION="${GITHUB_REF_NAME}"
+          [[ "$VERSION" == v* ]] || VERSION="v$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')-dev"
+          DMG="dist/kasalite-$VERSION.dmg"
+          STAGE="$(mktemp -d)"
+          cp -R dist/KasaLite.app "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "KasaLite" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+          rm -rf "$STAGE"
+          shasum -a 256 "$DMG" | awk '{print $1 "  " "'"$(basename "$DMG")"'"}' > "$DMG.sha256"
+          echo "built $DMG ($(du -h "$DMG" | cut -f1))"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+          echo "DMG_NAME=$(basename "$DMG")" >> "$GITHUB_ENV"
+
+      - name: Attach DMG to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          NOTES="$(cat <<'EOF'
+          KasaLite — 터미널만 남긴 kasaterm 고정판.
+
+          pane 나누기·탭·한글 IME·`kasaterm-cli`·헤더 진행 바만 있습니다.
+          캐릭터·보드·펫·서버·자동 업데이트·세션 복원은 없어요. 설정은 색 하나(⌘,).
+
+          ## 설치 (Windows)
+          `.msi` 다운로드 → 실행. SmartScreen 경고가 뜨면 "추가 정보 → 실행".
+          설치되면 시작 메뉴와 바탕화면에 KasaLite 가 생깁니다.
+
+          ## 설치 (macOS)
+          1. `.dmg` 다운로드 → 열기 → KasaLite 를 Applications 로 드래그
+          2. **처음 실행만**: Applications 에서 KasaLite **우클릭 → 열기** → "열기" 확인
+             (직접 만든 앱이라 macOS 가 한 번 확인받습니다. 이후엔 더블클릭)
+
+          ## 쓰는 법
+          열면 바로 터미널입니다. 자동 업데이트가 없으니 새 판은 여기서 받아 덮어쓰면 돼요.
+
+          살림은 macOS `~/.config/kasaterm-lite/`, Windows `%USERPROFILE%\.config\kasaterm-lite\`.
+          본판 kasaterm 과 같이 떠도 서로 안 보입니다.
+          EOF
+          )"
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "$DMG" "$DMG.sha256" --clobber
+            gh release edit "$VERSION" --title "KasaLite $VERSION" --notes "$NOTES"
+          else
+            gh release create "$VERSION" "$DMG" "$DMG.sha256" --title "KasaLite $VERSION" --notes "$NOTES"
+          fi
+
+      - name: Upload DMG artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DMG_NAME }}
+          path: |
+            ${{ env.DMG }}
+            ${{ env.DMG }}.sha256
