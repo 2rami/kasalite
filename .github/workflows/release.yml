@@ -105,14 +105,25 @@ jobs:
           # — 그대로 두면 hdiutil 이 "No space left on device" 로 선다. .app 은
           # 이미 dist/ 로 나왔으니 여기서 버려도 잃는 게 없다.
           rm -rf target/release/deps target/release/build target/release/incremental
-          df -h . | tail -1
           VERSION="${GITHUB_REF_NAME}"
           [[ "$VERSION" == v* ]] || VERSION="v$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')-dev"
           DMG="dist/kasalite-$VERSION.dmg"
-          STAGE="$(mktemp -d)"
+          # 스테이징을 TMPDIR 이 아니라 dist/ 안에 둔다 — 러너에서 hdiutil 이
+          # "No space left on device" 로 서는데 정작 df 는 93Gi 를 비워 두고
+          # 있었다. 볼륨이 갈릴 여지를 없애고 진단을 남긴다.
+          STAGE="dist/dmgroot"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
           cp -R dist/KasaLite.app "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "KasaLite" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+          APP_MB="$(du -sm dist/KasaLite.app | cut -f1)"
+          echo "app ${APP_MB}MB"
+          df -h / /System/Volumes/Data "${TMPDIR:-/tmp}" | tail -3
+          # -size 를 직접 준다. 안 주면 hdiutil 이 srcfolder 를 재는데, 그 안의
+          # /Applications 심볼릭 링크를 따라가면 러너의 Xcode 까지 세어 필요 용량이
+          # 수십 GB 로 뻥튀기된다 — 공간이 남아도 create 가 서는 이유로 남는 후보다.
+          hdiutil create -volname "KasaLite" -srcfolder "$STAGE" -ov -format UDZO \
+            -size "$((APP_MB + 150))m" "$DMG"
           rm -rf "$STAGE"
           shasum -a 256 "$DMG" | awk '{print $1 "  " "'"$(basename "$DMG")"'"}' > "$DMG.sha256"
           echo "built $DMG ($(du -h "$DMG" | cut -f1))"
