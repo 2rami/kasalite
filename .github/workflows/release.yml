@@ -136,7 +136,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          NOTES="$(cat <<'EOF'
+          # heredoc 을 $( ) 안에 두지 않는다 — 명령 치환을 파싱하는 단계에서 bash 가
+          # 백틱 짝을 맞추려 들어, 본문의 `…\` 처럼 백슬래시로 끝나는 코드 조각이
+          # 뒤따르는 백틱을 이스케이프해 버리면 "unexpected EOF" 로 선다. 파일로
+          # 빼면 본문은 그냥 텍스트가 된다.
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
           KasaLite — 터미널만 남긴 kasaterm 고정판.
 
           pane 나누기·탭·한글 IME·`kasaterm-cli`·헤더 진행 바만 있습니다.
@@ -157,12 +161,11 @@ jobs:
           살림은 macOS `~/.config/kasaterm-lite/`, Windows `%USERPROFILE%\.config\kasaterm-lite\`.
           본판 kasaterm 과 같이 떠도 서로 안 보입니다.
           EOF
-          )"
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release upload "$VERSION" "$DMG" "$DMG.sha256" --clobber
-            gh release edit "$VERSION" --title "KasaLite $VERSION" --notes "$NOTES"
+            gh release edit "$VERSION" --title "KasaLite $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
           else
-            gh release create "$VERSION" "$DMG" "$DMG.sha256" --title "KasaLite $VERSION" --notes "$NOTES"
+            gh release create "$VERSION" "$DMG" "$DMG.sha256" --title "KasaLite $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
           fi
 
       - name: Upload DMG artifact
