@@ -101,6 +101,11 @@ jobs:
       - name: Build .app + .dmg
         run: |
           bash scripts/build-lite-app.sh
+          # macOS 러너는 디스크가 좁아서 러스트 릴리스 중간물이 자리를 다 먹는다
+          # — 그대로 두면 hdiutil 이 "No space left on device" 로 선다. .app 은
+          # 이미 dist/ 로 나왔으니 여기서 버려도 잃는 게 없다.
+          rm -rf target/release/deps target/release/build target/release/incremental
+          df -h . | tail -1
           VERSION="${GITHUB_REF_NAME}"
           [[ "$VERSION" == v* ]] || VERSION="v$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')-dev"
           DMG="dist/kasalite-$VERSION.dmg"
