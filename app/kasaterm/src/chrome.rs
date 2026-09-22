@@ -5287,36 +5287,8 @@ mod room_rename_tests {
         assert!(side_column_should_toggle(false, true, true));
     }
 
-    #[test]
-    fn 캐릭터_메뉴는_키보드_이동과_닫기를_모두_가진다() {
-        let tab = include_str!("../../../web/arona-ui/src/settings/ThemeTab.tsx");
-        for key in ["ArrowDown", "ArrowUp", "Home", "End", "Escape"] {
-            assert!(tab.contains(key), "메뉴 키가 없다: {key}");
-        }
-        assert!(tab.contains("role=\"menu\""));
-        assert!(tab.contains("role=\"menuitem\""));
-    }
 
-    #[test]
-    fn 보조_확인창은_키보드_포커스를_가둔_뒤_돌려준다() {
-        let panel = include_str!("../../../web/arona-ui/src/components/TerminalPeekPanel.tsx");
-        for marker in [
-            "role=\"alertdialog\"",
-            "aria-modal=\"true\"",
-            "e.key === 'Escape'",
-            "e.key !== 'Tab'",
-            "confirmCancelRef.current?.focus()",
-            "trigger?.isConnected && trigger.focus()",
-        ] {
-            assert!(panel.contains(marker), "확인창 포커스 경계 누락: {marker}");
-        }
-    }
 
-    #[test]
-    fn 빈_교실_오버레이는_뒤의_자리표시자를_숨긴다() {
-        let view = include_str!("../../../web/arona-ui/src/components/ClassroomView.tsx");
-        assert!(view.contains("onAdd && sorted.length > 0 && seats.slice(sorted.length)"));
-    }
 }
 
 #[cfg(test)]

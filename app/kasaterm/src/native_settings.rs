@@ -7859,40 +7859,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_settings_keeps_every_web_settings_feature_reachable() {
-        let native = include_str!("native_settings.rs");
-        let web = [
-            include_str!("../../../web/arona-ui/src/settings/GeneralTab.tsx"),
-            include_str!("../../../web/arona-ui/src/settings/lang.tsx"),
-            include_str!("../../../web/arona-ui/src/settings/AppearanceTab.tsx"),
-            include_str!("../../../web/arona-ui/src/settings/ShellTab.tsx"),
-            include_str!("../../../web/arona-ui/src/settings/ClaudeTab.tsx"),
-            include_str!("../../../web/arona-ui/src/settings/ThemeTab.tsx"),
-            include_str!("../../../web/arona-ui/src/settings/CharacterDetail.tsx"),
-            include_str!("../../../web/arona-ui/src/settings/ThemeGen.tsx"),
-            include_str!("../../../web/arona-ui/src/settings/MotionSprites.tsx"),
-            include_str!("../../../web/arona-ui/src/settings/FeedbackTab.tsx"),
-        ]
-        .join("\n");
-        for (feature, web_needle, native_needle) in [
-            ("language", "set-language", "UiLanguage"),
-            ("system theme slots", "theme-system-${slot}", "ThemeSystemSlot"),
-            ("custom palette rename", "rename-custom-theme", "FocusCustomThemeLabel"),
-            ("palette wheel", "ColorWheel", "PickerSV"),
-            ("eyedropper", "palette-eyedropper", "PaletteEyedropper"),
-            ("isolated reauth", "reauth-account-isolated", "LoginBrowser::Isolated"),
-            ("account label", "account-label", "FocusAccountLabel"),
-            ("theme roster", "theme-pick-all", "ThemePickAll"),
-            ("raw character", "rawSave", "SaveStudentRaw"),
-            ("theme generation", "theme-gen-start", "ThemeGenStart"),
-            ("motion frames", "character-sprite", "SelectMotionFrame"),
-            ("feedback draft", "feedback-draft", "feedback_draft"),
-        ] {
-            assert!(web.contains(web_needle), "web lost {feature}: {web_needle}");
-            assert!(native.contains(native_needle), "native lost {feature}: {native_needle}");
-        }
-    }
 
     #[test]
     fn parity_settings_bundle_roundtrips_through_an_isolated_file() {

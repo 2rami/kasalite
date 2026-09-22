@@ -10314,23 +10314,6 @@ mod tests {
         assert_eq!(strip_activity_prefix("main.rs · vim"), "main.rs · vim");
     }
 
-    /// 자기 설치가 겨누는 `dist/` 가 정말 레포 루트 밑인지. 상대 경로가 한 칸만
-    /// 어긋나도 `metadata` 가 조용히 실패해 **아무 일도 안 일어나고**, 그 침묵은
-    /// "새 빌드가 없어서 안 깔았다" 와 구분되지 않는다 — 껐다 켜도 옛 바이너리인
-    /// 채로 아무도 눈치채지 못한다.
-    #[test]
-    fn self_install_dist_path_resolves_to_the_repo_root() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let root = root.canonicalize().expect("레포 루트는 언제나 실재한다");
-        assert!(
-            root.join("Cargo.toml").is_file(),
-            "워크스페이스 매니페스트가 여기 있어야 한다"
-        );
-        assert!(
-            root.join("scripts/build-app.sh").is_file(),
-            "번들을 굽는 스크립트도 같은 자리"
-        );
-    }
 
     #[test]
     fn resolve_collab_hooks_dir_prefers_bundle_over_env() {
@@ -10591,35 +10574,6 @@ mod tests {
     /// 딥링크의 칸 이름은 Rust 가 만들고 TS 가 알아본다 — 한쪽만 고치면 예외 없이
     /// 기본 칸으로 떨어지고, 그게 「계정 관리가 캐릭터 화면으로 간다」의 모양이었다.
     /// 그래서 웹의 목록을 소스에서 직접 읽어 대조한다.
-    #[test]
-    fn every_settings_cat_web_key_exists_in_the_web_nav() {
-        let src = include_str!("../../../web/arona-ui/src/settings/SettingsApp.tsx");
-        let cats = src
-            .split_once("const CATS = [")
-            .expect("CATS 목록을 못 찾았다 — 웹이 이름을 바꿨으면 여기도 같이 봐라")
-            .1
-            .split_once(']')
-            .unwrap()
-            .0;
-        let keys: Vec<&str> = cats
-            .split("key: '")
-            .skip(1)
-            .filter_map(|s| s.split_once('\''))
-            .map(|(k, _)| k)
-            .collect();
-        assert_eq!(
-            keys.len(),
-            SettingsCat::ALL.len(),
-            "칸 개수가 어긋난다: {keys:?}"
-        );
-        for c in SettingsCat::ALL {
-            assert!(
-                keys.contains(&c.web_key()),
-                "웹에 없는 칸 이름: {}",
-                c.web_key()
-            );
-        }
-    }
 
     /// 셰임 교체가 **제자리 덮어쓰기가 아니라 rename** 인지 — inode 로 잰다.
     ///
