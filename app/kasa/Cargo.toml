@@ -10,6 +10,9 @@ readme = "../../README.md"
 keywords = ["terminal", "multiplexer", "tui", "tmux"]
 categories = ["command-line-utilities"]
 
+[package.metadata.dist]
+dist = true
+
 [[bin]]
 name = "kasa"
 path = "src/main.rs"

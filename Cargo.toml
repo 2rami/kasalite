@@ -26,3 +26,7 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# dist 가 릴리스를 구울 때 쓰는 프로필.
+[profile.dist]
+inherits = "release"

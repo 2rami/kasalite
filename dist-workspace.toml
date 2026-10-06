@@ -1,0 +1,21 @@
+[workspace]
+members = ["cargo:."]
+
+# 굽기·설치기 설정(dist, 옛 cargo-dist). `v*` 태그를 밀면 .github/workflows/release.yml 이 굽고
+# GitHub 릴리스·Homebrew 탭·npm 에 싣는다. 태그를 밀기 전엔 아무것도 게시되지 않는다.
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "powershell", "npm", "homebrew"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+tap = "2rami/homebrew-tap"
+publish-jobs = ["homebrew", "npm"]
+install-path = "CARGO_HOME"
+install-updater = false
+pr-run-mode = "plan"
