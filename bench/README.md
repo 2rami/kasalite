@@ -39,7 +39,7 @@ Metal 의 `presentedTime` 이 같은 시계라 화면에 뜬 시각과 바로 �
 | `flood` | `t` | 출력 폭주 구간의 시작과 끝에 한 번씩 |
 
 **`KASALITE_BENCH=keys=40,flood_ms=3000`** — 켜진 뒤 1초 쉬고, 초점 칸에 `flood_ms` 동안 색 섞인 출력을 흘린다
-(`flood` 줄로 앞뒤를 표시). 2초 쉰 뒤 키 `keys` 개를 150ms 간격으로 자기 뷰에 넣는다(macOS 는 NSEvent keyDown 을
+(`flood` 줄로 앞뒤를 표시). 2초 쉰 뒤 키 `keys` 개를 150ms(+0~8ms 흩뜨림 — 박자와 같은 자리에 늘 떨어지지 않게) 간격으로 자기 뷰에 넣는다(macOS 는 NSEvent keyDown 을
 winit 뷰에 직접 — 창 서버를 안 거쳐 사람 초점을 안 뺏는다). 끝나면 스스로 닫힌다.
 
 **`KASALITE_AUTOSEND=<글>`·`KASALITE_AUTOSEND_MS`** — 초점 칸에 글을 넣고 줄을 끝낸다(옛 `KASATERM_AUTOSEND` 와 같음).

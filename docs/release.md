@@ -1,6 +1,6 @@
 # kasa tui 릴리스
 
-굽기·게시는 dist(`dist-workspace.toml`)가 맡는다. `v*` 태그를 밀면 `.github/workflows/release.yml` 이
+굽기·게시는 dist(`dist-workspace.toml`)가 맡는다. `kasa-tui-v*` 태그를 밀면 `.github/workflows/kasa-tui-release.yml` 이
 다섯 대상(macOS arm64·x86_64, Linux arm64·x86_64, Windows x86_64)을 굽고 GitHub 릴리스를 만든 뒤
 Homebrew 탭과 npm 에 싣는다. 태그를 밀기 전엔 아무것도 게시되지 않는다.
 
@@ -19,7 +19,10 @@ Homebrew 탭과 npm 에 싣는다. 태그를 밀기 전엔 아무것도 게시�
 
 1. `app/kasa/Cargo.toml` 의 `version` 을 올린다.
 2. 엔진을 올릴 거면 `Cargo.toml` 의 kasaterm `rev` 를 바꾸고 `cargo build -p kasa-tui` 로 확인한다.
-3. 커밋·푸시 뒤 `git tag v<판> && git push origin v<판>`.
+3. 커밋·푸시 뒤 `git tag kasa-tui-v<판> && git push origin kasa-tui-v<판>`.
+
+태그 이름표(`tag-namespace = "kasa-tui"`)는 카사라이트의 `lite-v*` 태그를 dist 가 잡지 않게 하려고 둔다.
+카사라이트 릴리스는 「최신(latest)」으로 표시하지 않는다 — 셸 설치기가 `releases/latest/download/` 를 쓴다.
 
 ## 서명
 

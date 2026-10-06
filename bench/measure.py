@@ -217,13 +217,14 @@ def measure(args):
 
     # 메모리·유휴: 창 1·칸 1. 셸 프롬프트가 뜨고 가라앉은 뒤 잰다. 그다음 1만 줄을 흘려 스크롤백 증가분을 본다.
     fill = "seq 1 10000; clear"
-    run = Run(exe, {"KASATERM_AUTOSEND": fill, "KASALITE_AUTOSEND": fill, "KASATERM_AUTOSEND_MS": "6000", "KASALITE_AUTOSEND_MS": "6000"})
+    # 쉼 깨어남은 흘려보내기 전(3~9초)에 잰다 — 겹치면 `seq` 출력이 깨어남으로 잡힌다.
+    run = Run(exe, {"KASATERM_AUTOSEND": fill, "KASALITE_AUTOSEND": fill, "KASATERM_AUTOSEND_MS": "10000", "KASALITE_AUTOSEND_MS": "10000"})
     try:
         run.first_window_ms()
         time.sleep(3)
         r["mem_1pane_mb"] = run.footprint_mb()
         r["idle_wakeups_per_s"] = run.idle_wakeups_per_s()
-        time.sleep(max(0.0, 6.0 + 3.0 - (time.time() - run.t_spawn)))
+        time.sleep(max(0.0, 10.0 + 3.0 - (time.time() - run.t_spawn)))
         r["mem_1pane_10k_mb"] = run.footprint_mb()
         if r["mem_1pane_mb"] and r["mem_1pane_10k_mb"]:
             r["mem_10k_delta_mb"] = round(r["mem_1pane_10k_mb"] - r["mem_1pane_mb"], 1)

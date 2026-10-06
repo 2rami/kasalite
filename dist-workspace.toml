@@ -1,9 +1,12 @@
 [workspace]
 members = ["cargo:."]
 
-# 굽기·설치기 설정(dist, 옛 cargo-dist). `v*` 태그를 밀면 .github/workflows/release.yml 이 굽고
+# 굽기·설치기 설정(dist, 옛 cargo-dist). `kasa-tui-v*` 태그를 밀면 .github/workflows/release.yml 이 굽고
 # GitHub 릴리스·Homebrew 탭·npm 에 싣는다. 태그를 밀기 전엔 아무것도 게시되지 않는다.
+# 카사라이트(dmg·msi)는 `lite-v*` 태그로 release-lite.yml 이 따로 굽는다 — 이름표가 없으면 dist 가 라이트
+# 태그까지 잡아 패키지를 못 찾고 선다.
 [dist]
+tag-namespace = "kasa-tui"
 cargo-dist-version = "0.32.0"
 ci = "github"
 installers = ["shell", "powershell", "npm", "homebrew"]

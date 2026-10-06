@@ -1,0 +1,39 @@
+[package]
+name = "kasalite"
+description = "KasaLite — a light, fast GUI terminal: splits, tabs, Korean IME, kitty and iTerm2 images, 120Hz. Draws with kasaterm's terminal engine."
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# 라이트는 dmg·msi 로 따로 굽는다(.github/workflows/release-lite.yml). dist 는 kasa tui 만 맡는다.
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+# 옛 v0.1 번들의 실행 파일 이름 그대로 — 설치본·자동 실행 항목이 이어진다.
+name = "kasaterm-lite"
+path = "src/main.rs"
+
+[dependencies]
+kasa-pty.workspace = true
+kasa-screen.workspace = true
+kasa-socket.workspace = true
+kasa-gridview.workspace = true
+kasa-cells.workspace = true
+kasa-ime.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json = "1"
+winit = "0.30"
+wgpu = "28"
+arboard = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSRunLoop", "NSObject", "NSGeometry", "NSDate"] }
+objc2-app-kit = { version = "0.3", features = ["NSResponder", "NSView", "NSEvent", "NSScreen", "NSWindow", "NSGraphicsContext", "objc2-quartz-core"] }
+objc2-quartz-core = { version = "0.3", features = ["CADisplayLink", "CAFrameRateRange", "CABase"] }

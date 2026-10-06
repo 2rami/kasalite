@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "app/kasa",
+    "app/lite",
 ]
 
 [workspace.package]
@@ -12,11 +13,14 @@ repository = "https://github.com/2rami/kasalite"
 # 터미널 엔진의 원본은 kasaterm 레포 `crates/` 다. 여기서는 커밋 하나를 고정해 받는다 —
 # 엔진을 올릴 때만 이 rev 를 바꾼다(docs/terminal-engine.md, kasaterm).
 [workspace.dependencies]
-kasa-pty = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa", default-features = false }
-kasa-screen = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa" }
-kasa-socket = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa", default-features = false }
-kasa-collab = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa" }
-kasa-agents = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa" }
+kasa-pty = { git = "https://github.com/2rami/kasaterm", rev = "1cdbb10b0ec63170e92c7b462c0700f127ddce36", default-features = false }
+kasa-screen = { git = "https://github.com/2rami/kasaterm", rev = "1cdbb10b0ec63170e92c7b462c0700f127ddce36" }
+kasa-socket = { git = "https://github.com/2rami/kasaterm", rev = "1cdbb10b0ec63170e92c7b462c0700f127ddce36", default-features = false }
+kasa-collab = { git = "https://github.com/2rami/kasaterm", rev = "1cdbb10b0ec63170e92c7b462c0700f127ddce36" }
+kasa-agents = { git = "https://github.com/2rami/kasaterm", rev = "1cdbb10b0ec63170e92c7b462c0700f127ddce36" }
+kasa-gridview = { git = "https://github.com/2rami/kasaterm", rev = "1cdbb10b0ec63170e92c7b462c0700f127ddce36" }
+kasa-cells = { git = "https://github.com/2rami/kasaterm", rev = "1cdbb10b0ec63170e92c7b462c0700f127ddce36" }
+kasa-ime = { git = "https://github.com/2rami/kasaterm", rev = "1cdbb10b0ec63170e92c7b462c0700f127ddce36" }
 anyhow = "1"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }

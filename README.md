@@ -4,11 +4,38 @@
 
 - **`kasa tui`** — 앱을 깔지 않고 아무 터미널(Ghostty·iTerm2·Windows Terminal·SSH 너머 서버) 안에서
   tmux 처럼 도는 다중 칸 터미널. 칸 나누기·탭·마우스·스크롤백·한글·kitty 그림을 지원한다.
-- **새 카사라이트** — 120Hz 로 가볍게 도는 바닐라 GUI 터미널(만드는 중).
+- **카사라이트(KasaLite)** — 120Hz 로 가볍게 도는 바닐라 GUI 터미널. 칸 나누기·탭·한글·kitty/iTerm2 그림.
 
-엔진(PTY·VT·스크롤백·kitty 그림·화면 낱말)의 원본은 kasaterm 레포 `crates/` 다. 여기서는 커밋 하나를
+엔진(PTY·VT·스크롤백·kitty 그림·화면 낱말·칸 그리기)의 원본은 kasaterm 레포 `crates/` 다. 여기서는 커밋 하나를
 고정해 git 의존으로 받는다(`Cargo.toml` 의 `[workspace.dependencies]`). 설계는 kasaterm
 [`docs/terminal-engine.md`](https://github.com/2rami/kasaterm/blob/main/docs/terminal-engine.md).
+
+## 카사라이트
+
+macOS `.dmg`·Windows `.msi` 를 [릴리스](https://github.com/2rami/kasalite/releases)의 `lite-v*` 판에서 받는다.
+칸 그리기는 본판 카사텀과 같은 엔진(`kasa-gridview`)이라 글자·색·상자 선·그림이 본판과 같게 나온다.
+
+| 단축키(macOS ⌘ · Windows Ctrl+Shift) | 하는 일 |
+|---|---|
+| `D` · `⇧D`(Windows `E`, 또는 Alt+Shift+`=`/`-`) | 오른쪽 · 아래로 나누기 |
+| `T` · `W` | 새 탭 · 칸 닫기 |
+| `[` `]` · `⇧[` `⇧]` · `1`–`9` | 칸 옮기기 · 탭 옮기기 · 탭 고르기 |
+| `=` `-` `0` | 글자 크기 |
+| `C` `V` | 복사 · 붙여넣기 |
+
+경계선을 끌면 칸 크기가, 탭 줄을 누르면 탭이 바뀐다. 칸 안 프로그램이 마우스를 켰으면 그 프로그램에 넘기고,
+`Shift` 를 누르고 끌면 그래도 고른다. 칸 안에서 `kasaterm-cli split right`·`tab`·`rename-window`·`send` 가 돈다.
+살림은 `~/.config/kasaterm-lite/`(옛 v0.1 과 같은 자리, `settings.json` 의 `font_size`·`font_path`).
+자동 업데이트는 없다.
+
+박자: macOS 는 디스플레이 링크(ProMotion 120Hz 요청) + Immediate + drawable 3장, 키 메아리는 박자를 안
+기다리고 바로 그린다. 고른 근거는 [`spikes/frame-pacing`](spikes/frame-pacing/README.md), 목표 수치 재는 법은
+[`bench/`](bench/README.md).
+
+```sh
+scripts/lite/bundle-mac.sh --dmg      # dist/KasaLite.app · KasaLite-<판>-macos-<arch>.dmg
+pwsh scripts/lite/package-windows.ps1  # dist/KasaLite-<판>-windows-x86_64.msi (Windows)
+```
 
 ## kasa tui
 
@@ -91,7 +118,8 @@ cargo --config patch.toml build -p kasa-tui
 ## 옛 카사라이트(v0.1)
 
 본판을 통째로 복사해 터미널만 남긴 옛 판은 [`legacy-v0.1`](https://github.com/2rami/kasalite/tree/legacy-v0.1)
-가지와 `v0.1.0` 태그에 그대로 있다. 릴리스의 `.dmg`·`.msi` 도 그 판이다.
+가지와 `v0.1.0` 태그에 그대로 있다. 새 판(`lite-v0.2.0`~)은 같은 번들 id·MSI UpgradeCode·살림 폴더를 이어
+받아, 덮어 깔면 옛 판을 대신한다.
 
 ## 라이선스
 

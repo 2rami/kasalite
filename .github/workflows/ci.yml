@@ -14,8 +14,9 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # LFS 없이 받는다 — 라이트의 내장 글꼴은 포인터로 박혀도 컴파일·시험은 되고, LFS 대역은 릴리스에 아낀다.
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked -p kasa-tui
-      - run: cargo test --locked -p kasa-tui
+      - run: cargo build --locked -p kasa-tui -p kasalite
+      - run: cargo test --locked -p kasa-tui -p kasalite
