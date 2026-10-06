@@ -233,18 +233,43 @@ pub fn draw_borders(buf: &mut Buffer, area: Rect, layout: &LayoutMsg) {
     }
 }
 
-/// 탭 줄에서 누를 수 있는 자리(탭 번호, 시작 열, 끝 열).
-pub type TabHits = Vec<(usize, u16, u16)>;
+/// 상태 줄에서 누를 수 있는 것. 접두키 없이 마우스만으로도 칸을 다룰 수 있게 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    Tab(usize),
+    NewTab,
+    SplitRight,
+    SplitDown,
+    Zoom,
+    Close,
+    Help,
+}
+
+/// 상태 줄의 누를 자리(무엇, 시작 열, 끝 열).
+pub type StatusHits = Vec<(Hit, u16, u16)>;
 
 pub struct StatusLine<'a> {
     pub layout: &'a LayoutMsg,
-    pub prefix_label: &'a str,
+    /// 접두키 이름. 접두키를 끈 설정이면 `None`.
+    pub prefix_label: Option<&'a str>,
     pub prefix_armed: bool,
     pub message: Option<&'a str>,
     pub scroll_mode: Option<u32>,
 }
 
-pub fn draw_status(buf: &mut Buffer, area: Rect, s: &StatusLine) -> TabHits {
+const BUTTONS: [(Hit, &str); 5] = [
+    (Hit::SplitRight, " 옆으로 "),
+    (Hit::SplitDown, " 아래로 "),
+    (Hit::Zoom, " 확대 "),
+    (Hit::Close, " 닫기 "),
+    (Hit::Help, " ? "),
+];
+
+fn text_width(s: &str) -> u16 {
+    s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(1) as u16).sum()
+}
+
+pub fn draw_status(buf: &mut Buffer, area: Rect, s: &StatusLine) -> StatusHits {
     let y = area.y + area.height.saturating_sub(1);
     let base = Style::default().bg(Color::Indexed(236)).fg(Color::Indexed(250));
     for x in 0..area.width {
@@ -254,14 +279,15 @@ pub fn draw_status(buf: &mut Buffer, area: Rect, s: &StatusLine) -> TabHits {
             c.set_char(' ');
         }
     }
+    let right_edge = area.x + area.width;
     let mut x = area.x;
     let put = |buf: &mut Buffer, x: &mut u16, text: &str, style: Style| {
-        let (nx, _) = buf.set_stringn(*x, y, text, (area.x + area.width).saturating_sub(*x) as usize, style);
+        let (nx, _) = buf.set_stringn(*x, y, text, right_edge.saturating_sub(*x) as usize, style);
         *x = nx;
     };
+    let mut hits = Vec::new();
     put(buf, &mut x, &format!(" {} ", s.layout.session), base.fg(Color::Indexed(16)).bg(ACCENT).add_modifier(Modifier::BOLD));
     put(buf, &mut x, " ", base);
-    let mut hits = Vec::new();
     for (i, name) in s.layout.tabs.iter().enumerate() {
         let label = format!(" {i} {} ", truncate(name, 18));
         let style = if i == s.layout.active_tab {
@@ -271,25 +297,46 @@ pub fn draw_status(buf: &mut Buffer, area: Rect, s: &StatusLine) -> TabHits {
         };
         let start = x;
         put(buf, &mut x, &label, style);
-        hits.push((i, start, x));
+        hits.push((Hit::Tab(i), start, x));
     }
+    let start = x;
+    put(buf, &mut x, " + ", base.fg(Color::Indexed(252)));
+    hits.push((Hit::NewTab, start, x));
     if s.layout.zoomed {
         put(buf, &mut x, " [확대]", base.fg(Color::Indexed(214)));
     }
-    let right = match (s.scroll_mode, s.message, s.prefix_armed) {
-        (Some(n), _, _) => format!("스크롤 ↑{n} · q 끝 "),
-        (None, Some(m), _) => format!("{m} "),
-        (None, None, true) => format!("[{}] 명령 대기 · ? 도움말 ", s.prefix_label),
-        (None, None, false) => format!("{} ? 도움말 ", s.prefix_label),
+
+    // 오른쪽: 단추들, 그 왼쪽에 상태 글(스크롤·알림·접두키 대기).
+    let button_style = base.fg(Color::Indexed(252)).bg(Color::Indexed(238));
+    let buttons_w: u16 = BUTTONS.iter().map(|(_, t)| text_width(t) + 1).sum();
+    let mut bx = right_edge.saturating_sub(buttons_w);
+    if bx > x {
+        for (hit, label) in BUTTONS {
+            let start = bx;
+            buf.set_string(bx, y, label, button_style);
+            bx += text_width(label);
+            hits.push((hit, start, bx));
+            bx += 1;
+        }
+    }
+    let note = match (s.scroll_mode, s.message, s.prefix_armed, s.prefix_label) {
+        (Some(n), ..) => Some(format!("스크롤 ↑{n} · q 끝 ")),
+        (None, Some(m), ..) => Some(format!("{m} ")),
+        (None, None, true, Some(p)) => Some(format!("[{p}] 명령 대기 ")),
+        (None, None, false, Some(p)) => Some(format!("{p} 접두키 ")),
+        (None, None, _, None) => None,
     };
-    let rw = right.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(1) as u16).sum::<u16>();
-    if area.width > rw && area.x + area.width - rw > x {
-        let style = if s.prefix_armed || s.scroll_mode.is_some() {
-            base.fg(Color::Indexed(16)).bg(Color::Indexed(214))
-        } else {
-            base
-        };
-        buf.set_string(area.x + area.width - rw, y, &right, style);
+    if let Some(note) = note {
+        let nw = text_width(&note);
+        let limit = right_edge.saturating_sub(buttons_w + 1);
+        if limit > x + nw {
+            let style = if s.prefix_armed || s.scroll_mode.is_some() {
+                base.fg(Color::Indexed(16)).bg(Color::Indexed(214))
+            } else {
+                base
+            };
+            buf.set_string(limit - nw, y, &note, style);
+        }
     }
     hits
 }
@@ -324,8 +371,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("접두키 두 번", "접두키를 칸에 보내기"),
 ];
 
-pub fn draw_help(buf: &mut Buffer, area: Rect, prefix_label: &str) {
-    let w = 44u16.min(area.width);
+pub fn draw_help(buf: &mut Buffer, area: Rect, prefix_label: Option<&str>) {
+    let w = 48u16.min(area.width);
     let h = (HELP.len() as u16 + 4).min(area.height);
     let x0 = area.x + (area.width - w) / 2;
     let y0 = area.y + (area.height.saturating_sub(h)) / 2;
@@ -339,7 +386,11 @@ pub fn draw_help(buf: &mut Buffer, area: Rect, prefix_label: &str) {
             }
         }
     }
-    buf.set_stringn(x0 + 2, y0 + 1, format!("{prefix_label} 다음에 누른다"), (w - 4) as usize, style.add_modifier(Modifier::BOLD));
+    let head = match prefix_label {
+        Some(p) => format!("{p} 다음에 누른다 · 아래 줄 단추도 된다"),
+        None => "접두키를 껐다 — 아래 줄 단추를 누른다".to_string(),
+    };
+    buf.set_stringn(x0 + 2, y0 + 1, head, (w - 4) as usize, style.add_modifier(Modifier::BOLD));
     for (i, (k, d)) in HELP.iter().enumerate() {
         let y = y0 + 2 + i as u16;
         if y >= y0 + h - 1 {

@@ -8,12 +8,13 @@ use crate::keys::{Key, KeyInput, ALT, CTRL};
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub prefix: KeyInput,
+    /// `None` 이면 접두키를 끈다 — 키는 전부 칸으로 가고, 칸 다루기는 상태 줄 단추로 한다.
+    pub prefix: Option<KeyInput>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { prefix: KeyInput { key: Key::Char('b'), mods: CTRL } }
+        Self { prefix: Some(KeyInput { key: Key::Char('b'), mods: CTRL }) }
     }
 }
 
@@ -28,12 +29,12 @@ impl Config {
             }
             let Some((k, v)) = line.split_once('=') else { continue };
             if k.trim() == "prefix" {
-                if let Some(p) = parse_key(v.trim().trim_matches('"')) {
+                if let Some(p) = parse_prefix(v.trim().trim_matches('"')) {
                     cfg.prefix = p;
                 }
             }
         }
-        if let Some(p) = std::env::var("KASA_TUI_PREFIX").ok().and_then(|v| parse_key(&v)) {
+        if let Some(p) = std::env::var("KASA_TUI_PREFIX").ok().and_then(|v| parse_prefix(&v)) {
             cfg.prefix = p;
         }
         cfg
@@ -49,6 +50,14 @@ fn config_path() -> Option<std::path::PathBuf> {
     #[cfg(not(windows))]
     let home = std::env::var_os("HOME");
     home.map(|h| std::path::PathBuf::from(h).join(".config").join("kasa").join("tui.conf"))
+}
+
+/// `none` 이면 접두키를 끈다. 못 읽으면 `None`(설정을 그대로 둔다).
+fn parse_prefix(s: &str) -> Option<Option<KeyInput>> {
+    if s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("off") {
+        return Some(None);
+    }
+    parse_key(s).map(Some)
 }
 
 /// `C-b`·`C-a`·`C-Space`·`M-a` 꼴.
@@ -100,5 +109,7 @@ mod tests {
         assert_eq!(parse_key("M-x").map(|k| k.mods), Some(ALT));
         assert_eq!(parse_key("a"), None);
         assert_eq!(key_label(&parse_key("C-b").unwrap()), "^B");
+        assert_eq!(parse_prefix("none"), Some(None));
+        assert_eq!(parse_prefix("C-a").map(|p| p.is_some()), Some(true));
     }
 }

@@ -22,7 +22,7 @@ use crate::graphics::{self, Graphics};
 use crate::keys::{self, Button, Key, KeyInput, MouseKind};
 use crate::paths;
 use crate::proto::{self, ClientMsg, Command, Dir, LayoutMsg, ServerMsg};
-use crate::render::{self, Grids, Selection, StatusLine, TabHits};
+use crate::render::{self, Grids, Hit, Selection, StatusHits, StatusLine};
 
 enum Ev {
     Server(ServerMsg),
@@ -54,7 +54,7 @@ struct Ui {
     scroll_mode: bool,
     selection: Option<Selection>,
     drag: Option<Drag>,
-    tab_hits: TabHits,
+    status_hits: StatusHits,
     message: Option<(String, Instant)>,
     /// 다음에 그릴 때 바깥 터미널로 낼 OSC 52.
     clipboard_out: Option<String>,
@@ -130,7 +130,7 @@ pub fn run(session: &str, create: bool) -> Result<i32> {
         scroll_mode: false,
         selection: None,
         drag: None,
-        tab_hits: Vec::new(),
+        status_hits: Vec::new(),
         message: None,
         clipboard_out: None,
         graphics: Graphics::new(if probe.kitty { graphics::Mode::Kitty } else { graphics::Mode::Text }),
@@ -453,7 +453,7 @@ impl Ui {
             self.prefix_armed = false;
             return self.prefix_command(input);
         }
-        if is_prefix(&input, &self.cfg.prefix) {
+        if self.cfg.prefix.is_some_and(|p| is_prefix(&input, &p)) {
             self.prefix_armed = true;
             return None;
         }
@@ -463,7 +463,7 @@ impl Ui {
     }
 
     fn prefix_command(&mut self, input: KeyInput) -> Option<Exit> {
-        if is_prefix(&input, &self.cfg.prefix) {
+        if self.cfg.prefix.is_some_and(|p| is_prefix(&input, &p)) {
             self.send(ClientMsg::Key(input));
             return None;
         }
@@ -508,7 +508,10 @@ impl Ui {
                 return Some(Exit::Detached);
             }
             '?' => self.help = true,
-            _ => self.flash(format!("모르는 명령 {}-{c}", config::key_label(&self.cfg.prefix))),
+            _ => {
+                let label = self.cfg.prefix.as_ref().map(config::key_label).unwrap_or_default();
+                self.flash(format!("모르는 명령 {label}-{c}"));
+            }
         }
         None
     }
@@ -553,9 +556,28 @@ impl Ui {
         match m.kind {
             MouseEventKind::Down(b) => {
                 self.selection = None;
+                if self.help {
+                    self.help = false;
+                    return;
+                }
                 if y == status_row {
-                    if let Some((i, ..)) = self.tab_hits.iter().find(|(_, s, e)| x >= *s && x < *e) {
-                        self.command(Command::SelectTab(*i));
+                    if let Some((hit, ..)) = self.status_hits.iter().find(|(_, s, e)| x >= *s && x < *e).copied() {
+                        match hit {
+                            Hit::Tab(i) => self.command(Command::SelectTab(i)),
+                            Hit::NewTab => self.command(Command::NewTab),
+                            Hit::SplitRight => self.command(Command::Split { right: true }),
+                            Hit::SplitDown => self.command(Command::Split { right: false }),
+                            Hit::Zoom => self.command(Command::Zoom),
+                            Hit::Close => {
+                                if matches!(self.prompt, Some(Prompt::ConfirmClose)) {
+                                    self.prompt = None;
+                                    self.command(Command::ClosePane);
+                                } else {
+                                    self.prompt = Some(Prompt::ConfirmClose);
+                                }
+                            }
+                            Hit::Help => self.help = true,
+                        }
                     }
                     return;
                 }
@@ -676,10 +698,10 @@ impl Ui {
             let _ = out.write_all(osc52(&text).as_bytes());
             let _ = out.flush();
         }
-        let prefix_label = config::key_label(&self.cfg.prefix);
+        let prefix_label = self.cfg.prefix.as_ref().map(config::key_label);
         let prompt_text = match &self.prompt {
             Some(Prompt::RenameTab(buf)) => Some(format!("탭 이름: {buf}_  (Enter 확인 · Esc 취소)")),
-            Some(Prompt::ConfirmClose) => Some("이 칸을 닫을까요? y / n".to_string()),
+            Some(Prompt::ConfirmClose) => Some("이 칸을 닫을까요? y / n · 닫기 한 번 더".to_string()),
             None => None,
         };
         let message = prompt_text.or_else(|| self.message.as_ref().map(|(m, _)| m.clone()));
@@ -713,14 +735,14 @@ impl Ui {
                 area,
                 &StatusLine {
                     layout: &self.layout,
-                    prefix_label: &prefix_label,
+                    prefix_label: prefix_label.as_deref(),
                     prefix_armed: self.prefix_armed,
                     message: message.as_deref(),
                     scroll_mode: scroll,
                 },
             );
             if self.help {
-                render::draw_help(buf, area, &prefix_label);
+                render::draw_help(buf, area, prefix_label.as_deref());
             }
             // 진짜 커서를 초점 칸의 커서 자리에 둔다 — 바깥 터미널의 한글 조합 글자가 거기 뜬다.
             let focus = self.layout.panes.iter().find(|p| p.id == self.layout.focus);
@@ -734,7 +756,7 @@ impl Ui {
                 }
             }
         })?;
-        self.tab_hits = hits;
+        self.status_hits = hits;
         Ok(())
     }
 }
