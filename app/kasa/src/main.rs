@@ -1,5 +1,6 @@
 //! `kasa` — 아무 터미널 안에서 도는 다중 칸 터미널(`kasa tui`)과 그 세션 서버.
 
+mod chrome;
 mod client;
 mod collab;
 mod config;

@@ -2,19 +2,25 @@
 //!
 //! ```text
 //! prefix = C-a
+//! buttons = off      # 칸 머리 줄·칸 고르기 칩을 걷고 예전 상태 줄 단추로 (KASA_TUI_BUTTONS)
+//! pixel = block      # 도트 글자: auto · sextant(🬀 계열) · block(반블록만) (KASA_TUI_PIXEL)
 //! ```
 
 use crate::keys::{Key, KeyInput, ALT, CTRL};
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// `None` 이면 접두키를 끈다 — 키는 전부 칸으로 가고, 칸 다루기는 상태 줄 단추로 한다.
+    /// `None` 이면 접두키를 끈다 — 키는 전부 칸으로 가고, 칸 다루기는 단추로 한다.
     pub prefix: Option<KeyInput>,
+    /// 칸마다 머리 줄(번호·이름·확대·나누기·닫기)과 상태 줄의 칸 고르기 칩을 둔다.
+    pub buttons: bool,
+    /// 도트 글자에 섹스턴트를 쓸지. `None` 이면 바깥 터미널을 보고 고른다.
+    pub sextants: Option<bool>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { prefix: Some(KeyInput { key: Key::Char('b'), mods: CTRL }) }
+        Self { prefix: Some(KeyInput { key: Key::Char('b'), mods: CTRL }), buttons: true, sextants: None }
     }
 }
 
@@ -28,16 +34,45 @@ impl Config {
                 continue;
             }
             let Some((k, v)) = line.split_once('=') else { continue };
-            if k.trim() == "prefix" {
-                if let Some(p) = parse_prefix(v.trim().trim_matches('"')) {
-                    cfg.prefix = p;
-                }
+            cfg.set(k.trim(), v.trim().trim_matches('"'));
+        }
+        for (key, env) in [("prefix", "KASA_TUI_PREFIX"), ("buttons", "KASA_TUI_BUTTONS"), ("pixel", "KASA_TUI_PIXEL")] {
+            if let Ok(v) = std::env::var(env) {
+                cfg.set(key, v.trim());
             }
         }
-        if let Some(p) = std::env::var("KASA_TUI_PREFIX").ok().and_then(|v| parse_prefix(&v)) {
-            cfg.prefix = p;
-        }
         cfg
+    }
+
+    /// 못 읽는 값은 건너뛴다(앞의 값을 그대로 둔다).
+    fn set(&mut self, key: &str, value: &str) {
+        match key {
+            "prefix" => {
+                if let Some(p) = parse_prefix(value) {
+                    self.prefix = p;
+                }
+            }
+            "buttons" => {
+                if let Some(b) = parse_switch(value) {
+                    self.buttons = b;
+                }
+            }
+            "pixel" => match value.to_ascii_lowercase().as_str() {
+                "auto" => self.sextants = None,
+                "sextant" | "sextants" => self.sextants = Some(true),
+                "block" | "blocks" => self.sextants = Some(false),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn parse_switch(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Some(true),
+        "off" | "false" | "no" | "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -111,5 +146,19 @@ mod tests {
         assert_eq!(key_label(&parse_key("C-b").unwrap()), "^B");
         assert_eq!(parse_prefix("none"), Some(None));
         assert_eq!(parse_prefix("C-a").map(|p| p.is_some()), Some(true));
+    }
+
+    #[test]
+    fn reads_button_and_pixel_switches() {
+        let mut cfg = Config::default();
+        assert!(cfg.buttons);
+        cfg.set("buttons", "off");
+        cfg.set("pixel", "block");
+        assert!(!cfg.buttons);
+        assert_eq!(cfg.sextants, Some(false));
+        cfg.set("buttons", "maybe");
+        cfg.set("pixel", "auto");
+        assert!(!cfg.buttons);
+        assert_eq!(cfg.sextants, None);
     }
 }

@@ -22,6 +22,8 @@ use crate::proto::{
 
 /// 아래 한 줄은 탭 줄이다.
 const STATUS_ROWS: u16 = 1;
+/// 머리 줄을 얹을 칸의 최소 높이 — 머리를 빼고도 두 줄은 남아야 칸 노릇을 한다.
+const HEAD_MIN_ROWS: u16 = 3;
 
 /// 바깥 터미널이 남긴 정체. 서버가 물려받으면 칸의 자식이 그 터미널 전용 이스케이프를
 /// 보낸다. 본판 칸의 협업 주소(`KASATERM_*`)와 claude 마커도 걷는다 — 칸에서 띄운 서버가
@@ -101,6 +103,8 @@ struct Pane {
     scrolled: u32,
     /// 칸 크기를 알려 둔 값 — 같으면 다시 안 부른다.
     size: (u16, u16),
+    /// 머리 줄·칩에 보일 이름. 1초마다 고친다.
+    name: String,
 }
 
 struct Tab {
@@ -115,6 +119,7 @@ struct Client {
     tx: Sender<Vec<u8>>,
     attached: bool,
     size: (u16, u16),
+    heads: bool,
 }
 
 struct Server {
@@ -126,6 +131,8 @@ struct Server {
     clients: HashMap<u64, Client>,
     /// 칸 격자를 맞춘 창 크기 — 마지막으로 만진 클라이언트를 따른다(tmux `window-size latest`).
     size: (u16, u16),
+    /// 칸마다 머리 줄을 비울지 — 크기처럼 마지막으로 만진 클라이언트를 따른다.
+    heads: bool,
     cell_px: Option<(u16, u16)>,
     next_pane: u32,
     ev_tx: Sender<Ev>,
@@ -196,6 +203,7 @@ pub fn run(name: &str, size: (u16, u16), cwd: Option<String>) -> Result<i32> {
         panes: HashMap::new(),
         clients: HashMap::new(),
         size: (size.0.max(10), size.1.max(3)),
+        heads: false,
         cell_px: None,
         next_pane: 0,
         ev_tx,
@@ -256,7 +264,7 @@ impl Server {
             }
             if last_names.elapsed() >= Duration::from_secs(1) {
                 last_names = Instant::now();
-                if self.refresh_tab_names() {
+                if self.refresh_names() {
                     self.broadcast_layout();
                 }
             }
@@ -291,14 +299,14 @@ impl Server {
             }
             let _ = ev.send(Ev::Gone(id));
         })?;
-        self.clients.insert(id, Client { tx, attached: false, size: self.size });
+        self.clients.insert(id, Client { tx, attached: false, size: self.size, heads: self.heads });
         Ok(())
     }
 
     /// 참이면 서버를 끝낸다.
     fn on_msg(&mut self, id: u64, msg: ClientMsg) -> bool {
         match msg {
-            ClientMsg::Hello { protocol, cols, rows, cell_px } => {
+            ClientMsg::Hello { protocol, cols, rows, cell_px, heads } => {
                 if protocol != proto::PROTOCOL {
                     self.send(id, &ServerMsg::Bye(format!(
                         "서버 판이 다르다(서버 {}, 클라이언트 {protocol}) — `kasa kill {}` 뒤 다시 붙어라",
@@ -310,6 +318,7 @@ impl Server {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.attached = true;
                     c.size = (cols, rows);
+                    c.heads = heads;
                 }
                 self.set_cell_px(cell_px);
                 self.take_size(id);
@@ -461,6 +470,7 @@ impl Server {
                 return true;
             }
         }
+        self.refresh_names();
         self.apply_sizes();
         self.broadcast_layout();
         false
@@ -520,7 +530,7 @@ impl Server {
         kasa_pty::register_session(&id, &session);
         self.panes.insert(
             id.clone(),
-            Pane { session, modes: Modes::default(), title: None, scrolled: 0, size: (cols, rows) },
+            Pane { session, modes: Modes::default(), title: None, scrolled: 0, size: (cols, rows), name: "sh".into() },
         );
         self.shared.lock().unwrap().panes.insert(id.clone(), PaneMeta::default());
         Ok(id)
@@ -536,7 +546,7 @@ impl Server {
             zoomed: false,
         });
         self.active = self.tabs.len() - 1;
-        self.refresh_tab_names();
+        self.refresh_names();
         self.apply_sizes();
         Ok(())
     }
@@ -593,21 +603,32 @@ impl Server {
         (self.size.0, self.size.1.saturating_sub(STATUS_ROWS).max(1))
     }
 
-    /// 마지막으로 만진 클라이언트의 크기로 칸을 맞춘다.
+    /// 마지막으로 만진 클라이언트의 크기·머리 줄로 칸을 맞춘다.
     fn take_size(&mut self, id: u64) {
-        let Some(size) = self.clients.get(&id).filter(|c| c.attached).map(|c| c.size) else { return };
-        if size != self.size {
+        let Some((size, heads)) = self.clients.get(&id).filter(|c| c.attached).map(|c| (c.size, c.heads)) else {
+            return;
+        };
+        if size != self.size || heads != self.heads {
             self.size = size;
+            self.heads = heads;
             self.apply_sizes();
             self.broadcast_layout();
         }
+    }
+
+    /// 칸 하나의 바깥 자리에서 머리 줄 몫을 뗀 글자 자리.
+    fn pane_rect(&self, id: String, x: u16, y: u16, w: u16, h: u16) -> PaneRect {
+        let head = self.heads && h >= HEAD_MIN_ROWS;
+        let name = self.panes.get(&id).map(|p| p.name.clone()).unwrap_or_default();
+        let (y, h) = if head { (y + 1, h - 1) } else { (y, h) };
+        PaneRect { id, x, y, w: w.max(1), h: h.max(1), head, name }
     }
 
     /// 칸마다 경계선 몫을 뗀 글자 자리. 오른쪽·아래가 창 끝이 아니면 한 칸씩 내준다.
     fn tab_rects(&self, tab: &Tab) -> Vec<PaneRect> {
         let (cols, rows) = self.pane_area();
         if tab.zoomed {
-            return vec![PaneRect { id: tab.focus.clone(), x: 0, y: 0, w: cols, h: rows }];
+            return vec![self.pane_rect(tab.focus.clone(), 0, 0, cols, rows)];
         }
         tab.layout
             .leaf_rects(cols, rows)
@@ -615,7 +636,7 @@ impl Server {
             .map(|(id, x, y, w, h)| {
                 let w = if x + w < cols { w.saturating_sub(1) } else { w };
                 let h = if y + h < rows { h.saturating_sub(1) } else { h };
-                PaneRect { id, x, y, w: w.max(1), h: h.max(1) }
+                self.pane_rect(id, x, y, w, h)
             })
             .collect()
     }
@@ -634,8 +655,9 @@ impl Server {
             }
             if tab.zoomed {
                 let (cols, rows) = self.pane_area();
+                let r = self.pane_rect(tab.focus.clone(), 0, 0, cols, rows);
                 want.retain(|(id, ..)| *id != tab.focus);
-                want.push((tab.focus.clone(), cols, rows));
+                want.push((r.id, r.w, r.h));
             }
         }
         for (id, w, h) in want {
@@ -648,9 +670,10 @@ impl Server {
         }
     }
 
-    fn refresh_tab_names(&mut self) -> bool {
+    /// 칸 이름(학생 이름, 없으면 도는 프로그램)과 그걸 따르는 탭 자동 이름을 고친다. 바뀌었으면 참.
+    fn refresh_names(&mut self) -> bool {
         let mut changed = false;
-        let names: HashMap<String, String> = self
+        let students: HashMap<String, String> = self
             .shared
             .lock()
             .unwrap()
@@ -658,14 +681,21 @@ impl Server {
             .iter()
             .filter_map(|(id, m)| m.name.clone().map(|n| (id.clone(), n)))
             .collect();
-        for tab in &mut self.tabs {
-            let name = names
-                .get(&tab.focus)
+        for (id, p) in &mut self.panes {
+            let name = students
+                .get(id)
                 .cloned()
-                .or_else(|| self.panes.get(&tab.focus).and_then(|p| p.session.active_process_name()))
+                .or_else(|| p.session.active_process_name())
                 // 로그인 셸은 `-zsh` 처럼 앞에 `-` 가 붙어 온다.
                 .map(|n| n.trim_start_matches('-').to_string())
                 .unwrap_or_else(|| "sh".into());
+            if name != p.name {
+                p.name = name;
+                changed = true;
+            }
+        }
+        for tab in &mut self.tabs {
+            let name = self.panes.get(&tab.focus).map(|p| p.name.clone()).unwrap_or_else(|| "sh".into());
             if name != tab.auto_name {
                 tab.auto_name = name;
                 changed = true;
@@ -701,6 +731,12 @@ impl Server {
             tabs: self.tabs.iter().map(|t| t.name.clone().unwrap_or_else(|| t.auto_name.clone())).collect(),
             active_tab: self.active,
             panes: self.tab_rects(tab),
+            tab_panes: tab
+                .layout
+                .leaves()
+                .iter()
+                .map(|id| (id.to_string(), self.panes.get(*id).map(|p| p.name.clone()).unwrap_or_default()))
+                .collect(),
             dividers,
             focus: tab.focus.clone(),
             zoomed: tab.zoomed,
@@ -767,7 +803,7 @@ impl Server {
                 }
             }
             Ctl::Refresh => {
-                self.refresh_tab_names();
+                self.refresh_names();
             }
         }
         self.apply_sizes();

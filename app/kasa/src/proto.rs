@@ -13,14 +13,15 @@ use crate::keys::{KeyInput, Modes, MouseKind};
 
 /// 서버와 클라이언트가 같은 바이너리에서 나오지만, 판을 올린 뒤 옛 서버에 새 클라이언트가
 /// 붙는 일은 생긴다. 낱말이 바뀌면 올린다.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 const MAX_FRAME: usize = 64 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// 붙는 클라이언트의 첫 메시지. `cell_px` 는 바깥 터미널 글자 한 칸의 픽셀 크기(모르면 없음).
-    Hello { protocol: u32, cols: u16, rows: u16, cell_px: Option<(u16, u16)> },
+    /// `heads` 면 칸마다 맨 위 한 줄을 머리 줄(이름·단추)로 비워 달라는 뜻이다.
+    Hello { protocol: u32, cols: u16, rows: u16, cell_px: Option<(u16, u16)>, heads: bool },
     Resize { cols: u16, rows: u16, cell_px: Option<(u16, u16)> },
     /// 초점 칸에 키 하나.
     Key(KeyInput),
@@ -94,18 +95,24 @@ pub struct LayoutMsg {
     pub active_tab: usize,
     /// 지금 탭에서 보이는 칸들. 확대 중이면 초점 칸 하나.
     pub panes: Vec<PaneRect>,
+    /// 지금 탭의 모든 칸(번호 순서, id·이름). 확대 중에도 칸 고르기 칩이 다른 칸을 보여 준다.
+    pub tab_panes: Vec<(String, String)>,
     pub dividers: Vec<DividerMsg>,
     pub focus: String,
     pub zoomed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 칸이 그리는 글자 자리. 머리 줄이 있으면 그 줄은 `y - 1` 에 있고 여기 넓이에 들지 않는다.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PaneRect {
     pub id: String,
     pub x: u16,
     pub y: u16,
     pub w: u16,
     pub h: u16,
+    pub head: bool,
+    /// 머리 줄·칸 고르기 칩에 쓸 이름(학생 이름, 없으면 도는 프로그램).
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

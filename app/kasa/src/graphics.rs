@@ -16,6 +16,7 @@ use base64::Engine;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::chrome::{self, IconKey};
 use crate::proto::{ImageView, PaneRect};
 
 const PLACEHOLDER: char = '\u{10EEEE}';
@@ -90,11 +91,13 @@ pub struct Graphics {
     frame: u64,
     /// 파일별 원본 픽셀 크기(글자 자리표시용).
     dims: HashMap<String, Option<(u32, u32)>>,
+    /// 크롬 단추 그림. 몇 벌 안 되니 떠날 때까지 붙들어 둔다. 못 그리는 크기면 `None`.
+    icons: HashMap<IconKey, Option<u32>>,
 }
 
 impl Graphics {
     pub fn new(mode: Mode) -> Self {
-        Self { mode, sent: HashMap::new(), next_id: 1, frame: 0, dims: HashMap::new() }
+        Self { mode, sent: HashMap::new(), next_id: 1, frame: 0, dims: HashMap::new(), icons: HashMap::new() }
     }
 
     /// 이번 프레임에 보일 그림을 바깥 터미널에 준비시키고(보내기·놓기·지우기) 그 바이트를 낸다.
@@ -146,10 +149,11 @@ impl Graphics {
             return;
         }
         let mut buf = Vec::new();
-        for s in self.sent.values() {
-            buf.extend_from_slice(format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", s.id).as_bytes());
+        for id in self.sent.values().map(|s| s.id).chain(self.icons.values().flatten().copied()) {
+            buf.extend_from_slice(format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").as_bytes());
         }
         self.sent.clear();
+        self.icons.clear();
         let _ = out.write_all(&buf);
         let _ = out.flush();
     }
@@ -208,6 +212,50 @@ impl Graphics {
         }
     }
 
+    /// 크롬 단추 그림의 번호. 처음 보는 그림이면 그려 보내고 가상 놓기까지 건다 — `term.draw` 안에서
+    /// 불려도 이 바이트가 그 프레임의 자리표시보다 먼저 나간다(같은 stdout 버퍼).
+    pub fn chrome_icon(&mut self, key: &IconKey) -> Option<u32> {
+        if self.mode != Mode::Kitty {
+            return None;
+        }
+        if let Some(id) = self.icons.get(key) {
+            return *id;
+        }
+        let made = chrome::keycap_png(key).map(|png| {
+            let id = self.alloc_id();
+            let mut bytes = transmit_png(id, &png);
+            bytes.extend_from_slice(format!("\x1b_Ga=p,U=1,i={id},p=1,c={},r=1,q=2\x1b\\", key.cells).as_bytes());
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&bytes);
+            id
+        });
+        self.icons.insert(key.clone(), made);
+        made
+    }
+
+    /// 단추 그림 자리표시를 한 줄 `cells` 칸에 그린다. 투명한 도트 사이로 `bg` 가 비친다.
+    pub fn draw_chrome_icon(&self, buf: &mut Buffer, x: u16, y: u16, cells: u16, id: u32, bg: [u8; 3]) {
+        let fg = Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8);
+        for c in 0..cells {
+            let Some(cell) = buf.cell_mut((x + c, y)) else { continue };
+            cell.reset();
+            cell.set_symbol(&placeholder(0, c));
+            cell.set_style(Style::default().fg(fg).bg(chrome::color(bg)));
+        }
+    }
+
+    /// 한 칸 타일 그림을 `cells` 칸에 되풀이한다 — 칸마다 같은 (0, 0) 자리표시를 쓴다.
+    pub fn draw_chrome_tile(&self, buf: &mut Buffer, x: u16, y: u16, cells: u16, id: u32, bg: [u8; 3]) {
+        let fg = Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8);
+        let tile = placeholder(0, 0);
+        for c in 0..cells {
+            let Some(cell) = buf.cell_mut((x + c, y)) else { continue };
+            cell.reset();
+            cell.set_symbol(&tile);
+            cell.set_style(Style::default().fg(fg).bg(chrome::color(bg)));
+        }
+    }
+
     fn dims(&mut self, path: &str) -> Option<(u32, u32)> {
         *self.dims.entry(path.to_string()).or_insert_with(|| image::image_dimensions(path).ok())
     }
@@ -232,6 +280,10 @@ fn transmit(id: u32, path: &str) -> Option<Vec<u8>> {
         img.write_to(&mut out, image::ImageFormat::Png).ok()?;
         out.into_inner()
     };
+    Some(transmit_png(id, &png))
+}
+
+fn transmit_png(id: u32, png: &[u8]) -> Vec<u8> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(png);
     let chunks: Vec<&[u8]> = b64.as_bytes().chunks(CHUNK).collect();
     let mut out = Vec::with_capacity(b64.len() + chunks.len() * 32);
@@ -245,7 +297,7 @@ fn transmit(id: u32, path: &str) -> Option<Vec<u8>> {
         out.extend_from_slice(chunk);
         out.extend_from_slice(b"\x1b\\");
     }
-    Some(out)
+    out
 }
 
 /// 바깥 터미널에 kitty 그림 지원과 글자 칸 픽셀 크기를 묻는다. 날 모드에서, 입력 읽기 스레드를

@@ -17,12 +17,13 @@ use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
+use crate::chrome::{self, Action, Glyphs, Heads, Hit, HitBox, Painter, Pointer, StatusLine};
 use crate::config::{self, Config};
 use crate::graphics::{self, Graphics};
 use crate::keys::{self, Button, Key, KeyInput, MouseKind};
 use crate::paths;
 use crate::proto::{self, ClientMsg, Command, Dir, LayoutMsg, ServerMsg};
-use crate::render::{self, Grids, Hit, Selection, StatusHits, StatusLine};
+use crate::render::{self, Grids, Selection};
 
 enum Ev {
     Server(ServerMsg),
@@ -33,7 +34,8 @@ enum Ev {
 /// 접두키 뒤의 상태 줄 입력.
 enum Prompt {
     RenameTab(String),
-    ConfirmClose,
+    /// 이 칸을 닫을지 묻는 중.
+    ConfirmClose(String),
 }
 
 enum Drag {
@@ -54,7 +56,12 @@ struct Ui {
     scroll_mode: bool,
     selection: Option<Selection>,
     drag: Option<Drag>,
-    status_hits: StatusHits,
+    /// 지난 프레임에 그린 누를 자리(칸 머리 줄·상태 줄).
+    hits: Vec<HitBox>,
+    hover: Option<Hit>,
+    /// 누른 채 아직 안 뗀 단추 — 같은 단추 위에서 떼야 일한다.
+    pressed: Option<Hit>,
+    glyphs: Glyphs,
     message: Option<(String, Instant)>,
     /// 다음에 그릴 때 바깥 터미널로 낼 OSC 52.
     clipboard_out: Option<String>,
@@ -79,7 +86,9 @@ pub fn run(session: &str, create: bool) -> Result<i32> {
     let mut reader = stream;
     let (guard, probe) = TermGuard::enter()?;
     let cell_px = probe.cell_px.or_else(|| cell_px_from_ioctl(cols, rows));
-    proto::write_msg(&mut writer, &ClientMsg::Hello { protocol: proto::PROTOCOL, cols, rows, cell_px })?;
+    let cfg = Config::load();
+    let hello = ClientMsg::Hello { protocol: proto::PROTOCOL, cols, rows, cell_px, heads: cfg.buttons };
+    proto::write_msg(&mut writer, &hello)?;
 
     let (ev_tx, ev_rx) = unbounded::<Ev>();
     let (out_tx, out_rx) = unbounded::<Vec<u8>>();
@@ -119,8 +128,9 @@ pub fn run(session: &str, create: bool) -> Result<i32> {
             }
         })?;
     }
+    let glyphs = Glyphs::detect(cfg.sextants);
     let mut ui = Ui {
-        cfg: Config::load(),
+        cfg,
         tx: out_tx,
         layout: LayoutMsg { session: session.to_string(), ..LayoutMsg::default() },
         grids: Grids::new(),
@@ -130,7 +140,10 @@ pub fn run(session: &str, create: bool) -> Result<i32> {
         scroll_mode: false,
         selection: None,
         drag: None,
-        status_hits: Vec::new(),
+        hits: Vec::new(),
+        hover: None,
+        pressed: None,
+        glyphs,
         message: None,
         clipboard_out: None,
         graphics: Graphics::new(if probe.kitty { graphics::Mode::Kitty } else { graphics::Mode::Text }),
@@ -357,7 +370,11 @@ impl Ui {
                     if self.selection.as_ref().is_some_and(|s| !l.panes.iter().any(|p| p.id == s.pane)) {
                         self.selection = None;
                     }
-                    self.grids.retain(|id, _| l.panes.iter().any(|p| &p.id == id) || l.tabs.len() > 1);
+                    if matches!(&self.prompt, Some(Prompt::ConfirmClose(id)) if !l.tab_panes.iter().any(|(p, _)| p == id)) {
+                        self.prompt = None;
+                    }
+                    // 확대 중에 가려진 칸도 남긴다 — 서버는 되돌릴 때 그 칸을 다시 보내지 않는다.
+                    self.grids.retain(|id, _| l.tab_panes.iter().any(|(p, _)| p == id) || l.tabs.len() > 1);
                     self.layout = l;
                 }
                 ServerMsg::Frame(f) => {
@@ -408,9 +425,9 @@ impl Ui {
         }
         if let Some(prompt) = self.prompt.take() {
             match prompt {
-                Prompt::ConfirmClose => {
+                Prompt::ConfirmClose(id) => {
                     if matches!(input.key, Key::Char('y') | Key::Char('Y')) {
-                        self.command(Command::ClosePane);
+                        self.close_pane(id);
                     }
                 }
                 Prompt::RenameTab(mut buf) => match input.key {
@@ -496,7 +513,7 @@ impl Ui {
                 }
             }
             'z' => self.command(Command::Zoom),
-            'x' => self.prompt = Some(Prompt::ConfirmClose),
+            'x' => self.prompt = Some(Prompt::ConfirmClose(self.layout.focus.clone())),
             'c' => self.command(Command::NewTab),
             'n' => self.command(Command::NextTab),
             'p' => self.command(Command::PrevTab),
@@ -553,6 +570,9 @@ impl Ui {
             MouseButton::Middle => Button::Middle,
         };
         let status_row = terminal::size().map(|(_, r)| r.saturating_sub(1)).unwrap_or(u16::MAX);
+        if matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
+            self.hover = chrome::hit_at(&self.hits, x, y).cloned();
+        }
         match m.kind {
             MouseEventKind::Down(b) => {
                 self.selection = None;
@@ -560,25 +580,18 @@ impl Ui {
                     self.help = false;
                     return;
                 }
-                if y == status_row {
-                    if let Some((hit, ..)) = self.status_hits.iter().find(|(_, s, e)| x >= *s && x < *e).copied() {
-                        match hit {
-                            Hit::Tab(i) => self.command(Command::SelectTab(i)),
-                            Hit::NewTab => self.command(Command::NewTab),
-                            Hit::SplitRight => self.command(Command::Split { right: true }),
-                            Hit::SplitDown => self.command(Command::Split { right: false }),
-                            Hit::Zoom => self.command(Command::Zoom),
-                            Hit::Close => {
-                                if matches!(self.prompt, Some(Prompt::ConfirmClose)) {
-                                    self.prompt = None;
-                                    self.command(Command::ClosePane);
-                                } else {
-                                    self.prompt = Some(Prompt::ConfirmClose);
-                                }
-                            }
-                            Hit::Help => self.help = true,
+                if let Some(hit) = chrome::hit_at(&self.hits, x, y).cloned() {
+                    if b == MouseButton::Left {
+                        self.hover = Some(hit.clone());
+                        if hit.is_button() {
+                            self.pressed = Some(hit);
+                        } else {
+                            self.fire(hit);
                         }
                     }
+                    return;
+                }
+                if y == status_row {
                     return;
                 }
                 if b == MouseButton::Left {
@@ -639,6 +652,14 @@ impl Ui {
                 }
                 None => {}
             },
+            MouseEventKind::Up(_) if self.pressed.is_some() => {
+                let pressed = self.pressed.take();
+                if chrome::hit_at(&self.hits, x, y) == pressed.as_ref() {
+                    if let Some(hit) = pressed {
+                        self.fire(hit);
+                    }
+                }
+            }
             MouseEventKind::Up(b) => match self.drag.take() {
                 Some(Drag::Select) => {
                     let text = self.selection.as_ref().and_then(|s| {
@@ -692,6 +713,56 @@ impl Ui {
         }
     }
 
+    /// 단추를 뗐을 때(머리 줄은 누를 때) 할 일. 다른 칸의 단추면 그 칸으로 초점을 옮긴 뒤 한다 —
+    /// 서버는 한 연결의 메시지를 차례대로 처리하니 초점이 먼저 선다.
+    fn fire(&mut self, hit: Hit) {
+        match hit {
+            Hit::Tab(i) => self.command(Command::SelectTab(i)),
+            Hit::NewTab => self.command(Command::NewTab),
+            Hit::Help => self.help = true,
+            Hit::Head(id) | Hit::Chip(id) => {
+                if id != self.layout.focus {
+                    self.command(Command::Focus(id));
+                }
+            }
+            Hit::Act(target, action) => {
+                let id = target.unwrap_or_else(|| self.layout.focus.clone());
+                if action == Action::Close {
+                    if matches!(&self.prompt, Some(Prompt::ConfirmClose(p)) if *p == id) {
+                        self.prompt = None;
+                        self.close_pane(id);
+                    } else {
+                        self.prompt = Some(Prompt::ConfirmClose(id));
+                    }
+                    return;
+                }
+                if id != self.layout.focus {
+                    self.command(Command::Focus(id));
+                }
+                self.command(match action {
+                    Action::SplitRight => Command::Split { right: true },
+                    Action::SplitDown => Command::Split { right: false },
+                    _ => Command::Zoom,
+                });
+            }
+        }
+    }
+
+    fn close_pane(&mut self, id: String) {
+        if id != self.layout.focus {
+            self.command(Command::Focus(id));
+        }
+        self.command(Command::ClosePane);
+    }
+
+    /// 칸을 사람에게 부를 이름(「2 claude」).
+    fn pane_label(&self, id: &str) -> String {
+        match self.layout.tab_panes.iter().position(|(p, _)| p == id) {
+            Some(i) => format!("{} {}", i + 1, self.layout.tab_panes[i].1),
+            None => id.to_string(),
+        }
+    }
+
     fn draw(&mut self, term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         if let Some(text) = self.clipboard_out.take() {
             let mut out = std::io::stdout();
@@ -701,12 +772,14 @@ impl Ui {
         let prefix_label = self.cfg.prefix.as_ref().map(config::key_label);
         let prompt_text = match &self.prompt {
             Some(Prompt::RenameTab(buf)) => Some(format!("탭 이름: {buf}_  (Enter 확인 · Esc 취소)")),
-            Some(Prompt::ConfirmClose) => Some("이 칸을 닫을까요? y / n · 닫기 한 번 더".to_string()),
+            Some(Prompt::ConfirmClose(id)) => Some(format!("칸 {} 을(를) 닫을까요? y / n · 닫기 한 번 더", self.pane_label(id))),
             None => None,
         };
         let message = prompt_text.or_else(|| self.message.as_ref().map(|(m, _)| m.clone()));
         let scroll = self.scroll_mode.then(|| self.grids.get(&self.layout.focus).map(|g| g.scrolled).unwrap_or(0));
         let mut hits = Vec::new();
+        let pointer = Pointer { hover: self.hover.as_ref(), pressed: self.pressed.as_ref() };
+        let icon_px = self.cell_px.filter(|_| self.graphics.mode == graphics::Mode::Kitty);
         {
             let visible: Vec<(&str, &proto::ImageView)> = self
                 .layout
@@ -730,19 +803,27 @@ impl Ui {
                 }
             }
             render::draw_borders(buf, area, &self.layout);
-            hits = render::draw_status(
+            let mut painter = Painter { glyphs: self.glyphs, icons: icon_px.map(|px| (&mut *graphics, px)) };
+            if self.cfg.buttons {
+                let heads = Heads { layout: &self.layout, grids: &self.grids, pointer };
+                hits = chrome::draw_heads(buf, panes_area, &heads, &mut painter);
+            }
+            hits.extend(chrome::draw_status(
                 buf,
                 area,
                 &StatusLine {
                     layout: &self.layout,
+                    buttons: self.cfg.buttons,
+                    pointer,
                     prefix_label: prefix_label.as_deref(),
                     prefix_armed: self.prefix_armed,
                     message: message.as_deref(),
                     scroll_mode: scroll,
                 },
-            );
+                &mut painter,
+            ));
             if self.help {
-                render::draw_help(buf, area, prefix_label.as_deref());
+                render::draw_help(buf, area, prefix_label.as_deref(), self.cfg.buttons);
             }
             // 진짜 커서를 초점 칸의 커서 자리에 둔다 — 바깥 터미널의 한글 조합 글자가 거기 뜬다.
             let focus = self.layout.panes.iter().find(|p| p.id == self.layout.focus);
@@ -756,7 +837,7 @@ impl Ui {
                 }
             }
         })?;
-        self.status_hits = hits;
+        self.hits = hits;
         Ok(())
     }
 }
