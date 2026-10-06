@@ -2,6 +2,7 @@
 
 mod client;
 mod config;
+mod graphics;
 mod keys;
 mod paths;
 mod procinfo;

@@ -124,6 +124,7 @@ struct Server {
     clients: HashMap<u64, Client>,
     /// 칸 격자를 맞춘 창 크기 — 마지막으로 만진 클라이언트를 따른다(tmux `window-size latest`).
     size: (u16, u16),
+    cell_px: Option<(u16, u16)>,
     next_pane: u32,
     ev_tx: Sender<Ev>,
 }
@@ -189,6 +190,7 @@ pub fn run(name: &str, size: (u16, u16), cwd: Option<String>) -> Result<i32> {
         panes: HashMap::new(),
         clients: HashMap::new(),
         size: (size.0.max(10), size.1.max(3)),
+        cell_px: None,
         next_pane: 0,
         ev_tx,
     };
@@ -287,7 +289,7 @@ impl Server {
     /// 참이면 서버를 끝낸다.
     fn on_msg(&mut self, id: u64, msg: ClientMsg) -> bool {
         match msg {
-            ClientMsg::Hello { protocol, cols, rows } => {
+            ClientMsg::Hello { protocol, cols, rows, cell_px } => {
                 if protocol != proto::PROTOCOL {
                     self.send(id, &ServerMsg::Bye(format!(
                         "서버 판이 다르다(서버 {}, 클라이언트 {protocol}) — `kasa kill {}` 뒤 다시 붙어라",
@@ -300,16 +302,18 @@ impl Server {
                     c.attached = true;
                     c.size = (cols, rows);
                 }
+                self.set_cell_px(cell_px);
                 self.take_size(id);
                 self.send_layout(id);
                 for pane in self.panes.keys().cloned().collect::<Vec<_>>() {
                     self.send_full(id, &pane);
                 }
             }
-            ClientMsg::Resize { cols, rows } => {
+            ClientMsg::Resize { cols, rows, cell_px } => {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.size = (cols, rows);
                 }
+                self.set_cell_px(cell_px);
                 self.take_size(id);
             }
             ClientMsg::Key(k) => {
@@ -555,6 +559,22 @@ impl Server {
         self.panes.get_mut(&focus)
     }
 
+    /// 바깥 터미널의 글자 칸 픽셀 크기를 엔진에 알린다. 칸 안 프로그램(`kitten icat`·Claude Code)은
+    /// `TIOCGWINSZ` 의 픽셀 값으로 그림 칸 수를 재고, 0 이면 그리기를 포기한다. 값이 바뀌면 칸 크기를
+    /// 다시 알려 픽셀 값이 실리게 한다.
+    fn set_cell_px(&mut self, cell_px: Option<(u16, u16)>) {
+        let Some((w, h)) = cell_px.filter(|(w, h)| *w > 0 && *h > 0) else { return };
+        if self.cell_px == Some((w, h)) {
+            return;
+        }
+        self.cell_px = Some((w, h));
+        kasa_pty::set_cell_pixels(w as u32, h as u32);
+        for p in self.panes.values_mut() {
+            p.size = (0, 0);
+        }
+        self.apply_sizes();
+    }
+
     /// 칸이 차지할 수 있는 넓이(탭 줄 빼고).
     fn pane_area(&self) -> (u16, u16) {
         (self.size.0, self.size.1.saturating_sub(STATUS_ROWS).max(1))
@@ -773,6 +793,19 @@ fn to_frame(u: &ScreenUpdate, modes: Modes, scrolled: u32) -> PaneFrame {
         modes,
         title: u.title.clone(),
         scrolled,
+        images: u
+            .inline_images
+            .iter()
+            .map(|v| proto::ImageView {
+                id: v.id,
+                path: v.path.clone(),
+                row: v.row,
+                col: v.col,
+                cols: v.cols,
+                rows: v.rows,
+                clip: v.clip.as_ref().map(|c| (c.row, c.col, c.cols, c.rows)),
+            })
+            .collect(),
     }
 }
 

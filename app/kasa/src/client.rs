@@ -18,6 +18,7 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use crate::config::{self, Config};
+use crate::graphics::{self, Graphics};
 use crate::keys::{self, Button, Key, KeyInput, MouseKind};
 use crate::paths;
 use crate::proto::{self, ClientMsg, Command, Dir, LayoutMsg, ServerMsg};
@@ -57,6 +58,8 @@ struct Ui {
     message: Option<(String, Instant)>,
     /// 다음에 그릴 때 바깥 터미널로 낼 OSC 52.
     clipboard_out: Option<String>,
+    graphics: Graphics,
+    cell_px: Option<(u16, u16)>,
 }
 
 pub fn run(session: &str, create: bool) -> Result<i32> {
@@ -74,7 +77,9 @@ pub fn run(session: &str, create: bool) -> Result<i32> {
     };
     let mut writer = stream.try_clone()?;
     let mut reader = stream;
-    proto::write_msg(&mut writer, &ClientMsg::Hello { protocol: proto::PROTOCOL, cols, rows })?;
+    let (guard, probe) = TermGuard::enter()?;
+    let cell_px = probe.cell_px.or_else(|| cell_px_from_ioctl(cols, rows));
+    proto::write_msg(&mut writer, &ClientMsg::Hello { protocol: proto::PROTOCOL, cols, rows, cell_px })?;
 
     let (ev_tx, ev_rx) = unbounded::<Ev>();
     let (out_tx, out_rx) = unbounded::<Vec<u8>>();
@@ -97,7 +102,6 @@ pub fn run(session: &str, create: bool) -> Result<i32> {
         })?;
     }
 
-    let guard = TermGuard::enter()?;
     // 입력 스레드보다 먼저 만든다 — 터미널을 만들며 커서 위치를 묻는데, 그 답을 입력 스레드가
     // 먼저 읽어 가면 질의가 시간 초과로 실패한다.
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
@@ -129,8 +133,11 @@ pub fn run(session: &str, create: bool) -> Result<i32> {
         tab_hits: Vec::new(),
         message: None,
         clipboard_out: None,
+        graphics: Graphics::new(if probe.kitty { graphics::Mode::Kitty } else { graphics::Mode::Text }),
+        cell_px,
     };
     let outcome = ui.event_loop(&mut term, &ev_rx);
+    ui.graphics.clear_all(&mut std::io::stdout());
     drop(term);
     guard.leave();
     match outcome {
@@ -162,8 +169,10 @@ struct TermGuard {
 }
 
 impl TermGuard {
-    fn enter() -> Result<Self> {
+    fn enter() -> Result<(Self, graphics::Probe)> {
         terminal::enable_raw_mode()?;
+        // crossterm 이 입력을 읽기 시작하기 전에 묻는다 — 답을 crossterm 이 먹으면 못 받는다.
+        let probe = graphics::probe();
         // kitty 키보드 프로토콜을 아는 바깥 터미널이면 켠다 — 그래야 Shift+Enter 가 Enter 와
         // 갈려 들어와 claude 의 줄바꿈으로 넘길 수 있다.
         let kitty_keys = terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -177,7 +186,7 @@ impl TermGuard {
             restore_terminal(kitty_keys);
             prev(info);
         }));
-        Ok(Self { kitty_keys })
+        Ok((Self { kitty_keys }, probe))
     }
 
     fn leave(self) {
@@ -240,6 +249,12 @@ fn spawn_server(session: &str, size: (u16, u16)) -> Result<()> {
         std::thread::sleep(Duration::from_millis(25));
     }
     bail!("세션 서버가 5초 안에 서지 않았다 — 기록: {}", dir.join(format!("{session}.log")).display())
+}
+
+/// 유닉스에서는 `TIOCGWINSZ` 가 창 픽셀을 함께 준다. 모르는 터미널은 0 을 준다.
+fn cell_px_from_ioctl(cols: u16, rows: u16) -> Option<(u16, u16)> {
+    let ws = terminal::window_size().ok()?;
+    (ws.width > 0 && ws.height > 0 && cols > 0 && rows > 0).then(|| (ws.width / cols, ws.height / rows))
 }
 
 fn key_input(k: &KeyEvent) -> Option<KeyInput> {
@@ -369,7 +384,13 @@ impl Ui {
                 }
             }
             Event::Mouse(m) => self.on_mouse(m),
-            Event::Resize(cols, rows) => self.send(ClientMsg::Resize { cols, rows }),
+            Event::Resize(cols, rows) => {
+                // 글자 크기를 바꾸면(⌘+) 칸 수와 함께 칸 픽셀도 바뀐다.
+                if let Some(px) = cell_px_from_ioctl(cols, rows) {
+                    self.cell_px = Some(px);
+                }
+                self.send(ClientMsg::Resize { cols, rows, cell_px: self.cell_px });
+            }
             Event::FocusGained | Event::FocusLost => {}
         }
         None
@@ -549,6 +570,20 @@ impl Ui {
                     self.command(Command::Focus(p.id.clone()));
                 }
                 let (col, row) = (x - p.x, y - p.y);
+                if self.graphics.mode == graphics::Mode::Text && b == MouseButton::Left {
+                    let hit = self.grids.get(&p.id).and_then(|g| {
+                        g.images.iter().find(|v| {
+                            (row as i32) >= v.row
+                                && (row as i32) < v.row + v.rows as i32
+                                && col >= v.col
+                                && col < v.col + v.cols
+                        })
+                    });
+                    if let Some(v) = hit {
+                        graphics::open_externally(&v.path);
+                        return;
+                    }
+                }
                 // Shift 를 누르면 마우스를 켠 칸에서도 선택한다(다른 터미널들과 같은 약속).
                 let to_pane = self.grids.get(&p.id).is_some_and(|g| g.modes.mouse) && mods & keys::SHIFT == 0;
                 if to_pane {
@@ -650,12 +685,27 @@ impl Ui {
         let message = prompt_text.or_else(|| self.message.as_ref().map(|(m, _)| m.clone()));
         let scroll = self.scroll_mode.then(|| self.grids.get(&self.layout.focus).map(|g| g.scrolled).unwrap_or(0));
         let mut hits = Vec::new();
+        {
+            let visible: Vec<(&str, &proto::ImageView)> = self
+                .layout
+                .panes
+                .iter()
+                .filter_map(|p| self.grids.get(&p.id).map(|g| (p, g)))
+                .flat_map(|(p, g)| g.images.iter().map(move |v| (p.id.as_str(), v)))
+                .collect();
+            self.graphics.prepare(&visible, &mut std::io::stdout());
+        }
+        let graphics = &mut self.graphics;
         term.draw(|f| {
             let area = f.area();
             let panes_area = Rect { height: area.height.saturating_sub(1), ..area };
             let buf = f.buffer_mut();
             for p in &self.layout.panes {
-                render::draw_pane(buf, panes_area, p, self.grids.get(&p.id), self.selection.as_ref());
+                let grid = self.grids.get(&p.id);
+                render::draw_pane(buf, panes_area, p, grid, self.selection.as_ref());
+                if let Some(g) = grid.filter(|g| !g.images.is_empty()) {
+                    graphics.draw(buf, p, &p.id, &g.images);
+                }
             }
             render::draw_borders(buf, area, &self.layout);
             hits = render::draw_status(

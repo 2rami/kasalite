@@ -13,15 +13,15 @@ use crate::keys::{KeyInput, Modes, MouseKind};
 
 /// 서버와 클라이언트가 같은 바이너리에서 나오지만, 판을 올린 뒤 옛 서버에 새 클라이언트가
 /// 붙는 일은 생긴다. 낱말이 바뀌면 올린다.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 const MAX_FRAME: usize = 64 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// 붙는 클라이언트의 첫 메시지.
-    Hello { protocol: u32, cols: u16, rows: u16 },
-    Resize { cols: u16, rows: u16 },
+    /// 붙는 클라이언트의 첫 메시지. `cell_px` 는 바깥 터미널 글자 한 칸의 픽셀 크기(모르면 없음).
+    Hello { protocol: u32, cols: u16, rows: u16, cell_px: Option<(u16, u16)> },
+    Resize { cols: u16, rows: u16, cell_px: Option<(u16, u16)> },
     /// 초점 칸에 키 하나.
     Key(KeyInput),
     /// 초점 칸에 붙여넣기.
@@ -160,6 +160,24 @@ pub struct PaneFrame {
     pub title: Option<String>,
     /// 스크롤백을 올려 보고 있는 줄 수(0 = 살아 있는 끝).
     pub scrolled: u32,
+    /// 지금 칸에 보이는 그림 전부(OSC 1337·kitty). 프레임마다 통째로 온다.
+    pub images: Vec<ImageView>,
+}
+
+/// 칸에 보이는 그림 하나. 좌표는 칸 안 글자 칸이다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageView {
+    /// 칸 안에서 그림을 가리키는 번호 — 자리를 옮겨도 같다.
+    pub id: u64,
+    /// 서버 기계의 임시 파일(PNG·JPEG). 클라이언트는 같은 기계에서 돈다.
+    pub path: String,
+    /// 상자 맨 위 행. 스크롤로 위가 잘리면 음수.
+    pub row: i32,
+    pub col: u16,
+    pub cols: u16,
+    pub rows: u16,
+    /// 상자 안에서 실제로 보이는 칸(행, 열, 폭, 높이). 없으면 상자 전체.
+    pub clip: Option<(i32, u16, u16, u16)>,
 }
 
 pub fn write_msg<T: Serialize, W: Write>(w: &mut W, msg: &T) -> Result<()> {
@@ -211,6 +229,7 @@ mod tests {
             modes: Modes { app_cursor: true, ..Modes::default() },
             title: Some("vim".into()),
             scrolled: 0,
+            images: vec![ImageView { id: 7, path: "/tmp/a.png".into(), row: -2, col: 3, cols: 10, rows: 5, clip: None }],
         });
         let mut buf = Vec::new();
         write_msg(&mut buf, &msg).unwrap();
@@ -218,6 +237,7 @@ mod tests {
         let ServerMsg::Frame(f) = back else { panic!() };
         assert_eq!(f.dirty[0].1[0].ch, '한');
         assert!(f.modes.app_cursor);
+        assert_eq!(f.images[0].row, -2);
         assert!(read_msg::<ServerMsg, _>(&mut &[][..]).unwrap().is_none());
     }
 }

@@ -23,6 +23,7 @@ pub struct Grid {
     pub modes: Modes,
     pub title: Option<String>,
     pub scrolled: u32,
+    pub images: Vec<proto::ImageView>,
 }
 
 impl Grid {
@@ -45,6 +46,7 @@ impl Grid {
             self.title = f.title;
         }
         self.scrolled = f.scrolled;
+        self.images = f.images;
     }
 
     /// 칸 좌표 두 점 사이의 글. 넓은 글자의 빈 뒤칸은 건너뛰고 줄 끝 공백은 걷는다.

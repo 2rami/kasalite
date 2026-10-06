@@ -804,6 +804,7 @@ dependencies = [
  "base64",
  "bincode",
  "crossbeam-channel",
+ "image",
  "kasa-pty",
  "kasa-screen",
  "kasa-socket",
