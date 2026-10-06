@@ -65,6 +65,23 @@ fn scrub_env() {
     for k in SCRUB_ENV.iter().map(|s| s.to_string()).chain(kasaterm) {
         std::env::remove_var(k);
     }
+    // 본판 칸 안에서 띄우면 그 칸의 shim 폴더가 PATH 맨 앞과 ZDOTDIR 에 남는다. 그대로 두면 칸의
+    // `claude`·`kasaterm-cli` 가 본판 칸 정체를 찾다 실패한다.
+    if let Some(path) = std::env::var_os("PATH") {
+        let kept: Vec<_> = std::env::split_paths(&path).filter(|p| !is_kasaterm_shim(p)).collect();
+        if let Ok(joined) = std::env::join_paths(kept) {
+            std::env::set_var("PATH", joined);
+        }
+    }
+    if std::env::var_os("ZDOTDIR").is_some_and(|d| is_kasaterm_shim(std::path::Path::new(&d))) {
+        std::env::remove_var("ZDOTDIR");
+    }
+}
+
+fn is_kasaterm_shim(p: &std::path::Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("kasaterm-shim-") || n.starts_with("kasaterm-lite-shim-"))
 }
 
 enum Ev {
@@ -838,6 +855,13 @@ mod tests {
             wrapped: false,
             leading_wide_spacer: false,
         }
+    }
+
+    #[test]
+    fn spots_kasaterm_shim_dirs() {
+        assert!(is_kasaterm_shim(std::path::Path::new("/var/folders/x/T/kasaterm-shim-39679")));
+        assert!(is_kasaterm_shim(std::path::Path::new("/tmp/kasaterm-lite-shim-12")));
+        assert!(!is_kasaterm_shim(std::path::Path::new("/Users/kasa/.local/bin")));
     }
 
     #[test]
