@@ -12,9 +12,11 @@ repository = "https://github.com/2rami/kasalite"
 # 터미널 엔진의 원본은 kasaterm 레포 `crates/` 다. 여기서는 커밋 하나를 고정해 받는다 —
 # 엔진을 올릴 때만 이 rev 를 바꾼다(docs/terminal-engine.md, kasaterm).
 [workspace.dependencies]
-kasa-pty = { git = "https://github.com/2rami/kasaterm", rev = "c982d45c1cf92187d6795b0c4ab76161ec064593", default-features = false }
-kasa-screen = { git = "https://github.com/2rami/kasaterm", rev = "c982d45c1cf92187d6795b0c4ab76161ec064593" }
-kasa-socket = { git = "https://github.com/2rami/kasaterm", rev = "c982d45c1cf92187d6795b0c4ab76161ec064593", default-features = false }
+kasa-pty = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa", default-features = false }
+kasa-screen = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa" }
+kasa-socket = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa", default-features = false }
+kasa-collab = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa" }
+kasa-agents = { git = "https://github.com/2rami/kasaterm", rev = "d1a0e050f532015c8ff28ce117f997c1da66bcaa" }
 anyhow = "1"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }

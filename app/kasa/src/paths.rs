@@ -52,6 +52,19 @@ pub fn socket_path(session: &str) -> PathBuf {
     }
 }
 
+/// 세션의 협업 제어 소켓 — 칸 안 `kasaterm-cli` 가 `KASATERM_SOCKET_PATH` 로 붙는다.
+pub fn ctl_socket_path(session: &str) -> PathBuf {
+    #[cfg(unix)]
+    {
+        runtime_dir().join(format!("{session}.ctl.sock"))
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+        runtime_dir().join(format!("kasa-tui-ctl-{user}-{session}"))
+    }
+}
+
 /// 세션 표식 파일 — 윈도우는 파이프를 훑을 수 없어, `kasa ls` 가 이것으로 세션을 찾는다.
 pub fn marker_path(session: &str) -> PathBuf {
     runtime_dir().join(format!("{session}.session"))

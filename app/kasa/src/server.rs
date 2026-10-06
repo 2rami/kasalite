@@ -13,6 +13,7 @@ use kasa_screen::screen::{Cell, Color, ScreenUpdate};
 use kasa_socket::transport::{LocalListener, LocalStream};
 use unicode_width::UnicodeWidthChar;
 
+use crate::collab::{self, Ctl, PaneMeta, Shared, TuiBackend};
 use crate::keys::{self, Modes};
 use crate::paths;
 use crate::proto::{
@@ -90,6 +91,7 @@ enum Ev {
     Gone(u64),
     Screen(String, ScreenUpdate),
     Clipboard(String),
+    Ctl(Ctl),
 }
 
 struct Pane {
@@ -127,6 +129,8 @@ struct Server {
     cell_px: Option<(u16, u16)>,
     next_pane: u32,
     ev_tx: Sender<Ev>,
+    /// 협업 창구(제어 소켓 백엔드)와 함께 보는 칸·탭 사정.
+    shared: Arc<std::sync::Mutex<Shared>>,
 }
 
 struct ClipboardToClients(std::sync::Mutex<Sender<Ev>>);
@@ -161,6 +165,8 @@ pub fn run(name: &str, size: (u16, u16), cwd: Option<String>) -> Result<i32> {
     std::fs::write(&marker, std::process::id().to_string())?;
 
     let (ev_tx, ev_rx) = unbounded::<Ev>();
+    let shared = Arc::new(std::sync::Mutex::new(Shared::default()));
+    let _collab = start_collab(name, shared.clone(), ev_tx.clone())?;
     kasa_pty::set_host_policy(kasa_pty::HostPolicy {
         term_program: None,
         last_login_dir: None,
@@ -193,10 +199,12 @@ pub fn run(name: &str, size: (u16, u16), cwd: Option<String>) -> Result<i32> {
         cell_px: None,
         next_pane: 0,
         ev_tx,
+        shared,
     };
     srv.new_tab(cwd)?;
     let code = srv.serve(ev_rx);
     let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(paths::ctl_socket_path(name));
     #[cfg(unix)]
     let _ = std::fs::remove_file(&sock);
     Ok(code)
@@ -243,6 +251,7 @@ impl Server {
                     }
                 }
                 Some(Ev::Clipboard(text)) => self.broadcast(&ServerMsg::Clipboard(text)),
+                Some(Ev::Ctl(ctl)) => self.on_ctl(ctl),
                 None => {}
             }
             if last_names.elapsed() >= Duration::from_secs(1) {
@@ -508,10 +517,12 @@ impl Server {
                 }
             }
         })?;
+        kasa_pty::register_session(&id, &session);
         self.panes.insert(
             id.clone(),
             Pane { session, modes: Modes::default(), title: None, scrolled: 0, size: (cols, rows) },
         );
+        self.shared.lock().unwrap().panes.insert(id.clone(), PaneMeta::default());
         Ok(id)
     }
 
@@ -532,6 +543,8 @@ impl Server {
 
     fn pane_exited(&mut self, pane: &str) {
         self.panes.remove(pane);
+        self.shared.lock().unwrap().panes.remove(pane);
+        kasa_pty::release_session(pane);
         let Some(ti) = self.tabs.iter().position(|t| t.layout.leaves().contains(&pane)) else { return };
         let tab = &mut self.tabs[ti];
         if tab.layout.leaves().len() <= 1 {
@@ -637,11 +650,19 @@ impl Server {
 
     fn refresh_tab_names(&mut self) -> bool {
         let mut changed = false;
+        let names: HashMap<String, String> = self
+            .shared
+            .lock()
+            .unwrap()
+            .panes
+            .iter()
+            .filter_map(|(id, m)| m.name.clone().map(|n| (id.clone(), n)))
+            .collect();
         for tab in &mut self.tabs {
-            let name = self
-                .panes
+            let name = names
                 .get(&tab.focus)
-                .and_then(|p| p.session.active_process_name())
+                .cloned()
+                .or_else(|| self.panes.get(&tab.focus).and_then(|p| p.session.active_process_name()))
                 // 로그인 셸은 `-zsh` 처럼 앞에 `-` 가 붙어 온다.
                 .map(|n| n.trim_start_matches('-').to_string())
                 .unwrap_or_else(|| "sh".into());
@@ -704,7 +725,90 @@ impl Server {
     }
 
     fn broadcast_layout(&self) {
+        self.sync_shared();
         self.broadcast(&ServerMsg::Layout(self.layout_msg()));
+    }
+
+    /// 협업 창구가 보는 탭·초점·칸 자리를 지금 레이아웃에 맞춘다.
+    fn sync_shared(&self) {
+        let mut sh = self.shared.lock().unwrap();
+        sh.tabs = self.tabs.iter().map(|t| t.name.clone().unwrap_or_else(|| t.auto_name.clone())).collect();
+        sh.active_tab = self.active;
+        sh.focus = self.tabs.get(self.active).map(|t| t.focus.clone()).unwrap_or_default();
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let room = format!("{} · {}", self.name, sh.tabs[i]);
+            for leaf in tab.layout.leaves() {
+                if let Some(m) = sh.panes.get_mut(leaf) {
+                    m.room = room.clone();
+                    m.visible = i == self.active;
+                }
+            }
+        }
+    }
+
+    fn on_ctl(&mut self, ctl: Ctl) {
+        match ctl {
+            Ctl::Split { from, right, focus, reply } => {
+                let _ = reply.send(self.split_from(from, right, focus));
+            }
+            Ctl::NewTab { focus, reply } => {
+                let before = self.active;
+                let cwd = self.tabs.get(self.active).and_then(|t| self.panes.get(&t.focus)).and_then(pane_cwd);
+                let made = self.new_tab(cwd).map(|_| self.tabs[self.active].focus.clone());
+                if !focus {
+                    self.active = before;
+                }
+                let _ = reply.send(made);
+            }
+            Ctl::Focus(pane) => {
+                if let Some(i) = self.tabs.iter().position(|t| t.layout.leaves().contains(&pane.as_str())) {
+                    self.active = i;
+                    self.tabs[i].focus = pane;
+                }
+            }
+            Ctl::Refresh => {
+                self.refresh_tab_names();
+            }
+        }
+        self.apply_sizes();
+        self.broadcast_layout();
+    }
+
+    /// `from` 칸(없으면 초점 칸)을 나눈다. `right` 가 없으면 넓은 쪽으로. 새 칸은 `from` 을 부모로 안다.
+    fn split_from(&mut self, from: Option<String>, right: Option<bool>, focus: bool) -> anyhow::Result<String> {
+        let target = from
+            .clone()
+            .filter(|f| self.tabs.iter().any(|t| t.layout.leaves().contains(&f.as_str())))
+            .or_else(|| self.tabs.get(self.active).map(|t| t.focus.clone()))
+            .context("나눌 칸이 없다")?;
+        let ti = self.tabs.iter().position(|t| t.layout.leaves().contains(&target.as_str())).context("칸이 탭에 없다")?;
+        let right = right.unwrap_or_else(|| {
+            let (cols, rows) = self.pane_area();
+            self.tabs[ti]
+                .layout
+                .leaf_rects(cols, rows)
+                .into_iter()
+                .find(|(id, ..)| *id == target)
+                // 글자 칸은 세로로 약 두 배 길다 — 폭이 높이의 두 배를 넘으면 옆으로.
+                .map(|(_, _, _, w, h)| w as u32 >= h as u32 * 2)
+                .unwrap_or(true)
+        });
+        let cwd = self.panes.get(&target).and_then(pane_cwd);
+        let new_id = self.spawn_pane(cwd)?;
+        let dir = if right { SplitDir::Horizontal } else { SplitDir::Vertical };
+        let tab = &mut self.tabs[ti];
+        tab.layout.split_leaf(&target, dir, new_id.clone());
+        tab.zoomed = false;
+        if focus {
+            tab.focus = new_id.clone();
+            self.active = ti;
+        }
+        if let Some(parent) = from {
+            if let Some(m) = self.shared.lock().unwrap().panes.get_mut(&new_id) {
+                m.parent = Some(parent);
+            }
+        }
+        Ok(new_id)
     }
 
     fn send_full(&self, id: u64, pane: &str) {
@@ -730,6 +834,60 @@ impl Server {
         let frame = to_frame(&update, p.modes, p.scrolled);
         self.broadcast(&ServerMsg::Frame(frame));
     }
+}
+
+/// 협업 창구를 세운다: 칸 shim(훅·claude·kasaterm-cli), 제어 소켓 서버, 판 수집기, tell 전달.
+/// 돌려준 것을 쥐고 있어야 수집기가 돈다.
+fn start_collab(
+    name: &str,
+    shared: Arc<std::sync::Mutex<Shared>>,
+    ev_tx: Sender<Ev>,
+) -> Result<(Arc<dyn kasa_socket::Backend>, Option<kasa_collab::board_service::CollectorGuard>)> {
+    let shim = paths::runtime_dir().join(format!("{name}-shim"));
+    if let Err(e) = collab::install_shims(&shim) {
+        eprintln!("[kasa] 칸 shim 을 못 깔았다(협업 훅 없이 간다): {e:#}");
+    } else {
+        std::env::set_var("KASATERM_TMUX_SHIM_DIR", &shim);
+    }
+    let ctl_path = paths::ctl_socket_path(name);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&ctl_path);
+    std::env::set_var("KASATERM_SOCKET_PATH", &ctl_path);
+    kasa_collab::tell_service::set_storage_root(paths::runtime_dir().join(format!("{name}-collab")));
+    let (ctl_tx, ctl_rx) = unbounded::<Ctl>();
+    std::thread::Builder::new().name("kasa-ctl".into()).spawn(move || {
+        while let Ok(c) = ctl_rx.recv() {
+            if ev_tx.send(Ev::Ctl(c)).is_err() {
+                return;
+            }
+        }
+    })?;
+    let backend: Arc<dyn kasa_socket::Backend> = Arc::new(TuiBackend::new(shared, ctl_tx));
+    kasa_socket::server::Server::bind(&ctl_path)
+        .with_context(|| format!("제어 소켓 {}", ctl_path.display()))?
+        .spawn(backend.clone());
+    let label = kasa_collab::env::machine_label();
+    let guard = match kasa_collab::board_service::local_id() {
+        Ok(machine_id) => kasa_collab::board_service::register_with_config(
+            backend.clone(),
+            kasa_collab::board_service::CollectorConfig {
+                machine_id,
+                label,
+                journal_path: Some(paths::runtime_dir().join(format!("{name}.board.json"))),
+                remote_enabled: false,
+                source_override: None,
+                machines: None,
+            },
+        )
+        .map_err(|e| eprintln!("[kasa] 판 수집기를 못 세웠다: {e:#}"))
+        .ok(),
+        Err(e) => {
+            eprintln!("[kasa] 기계 id 를 못 읽었다(판 없이 간다): {e:#}");
+            None
+        }
+    };
+    kasa_collab::delivery::spawn(Arc::downgrade(&backend))?;
+    Ok((backend, guard))
 }
 
 fn pane_cwd(p: &Pane) -> Option<String> {

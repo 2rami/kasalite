@@ -752,9 +752,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "kasa-agents"
+version = "0.2.33"
+source = "git+https://github.com/2rami/kasaterm?rev=d1a0e050f532015c8ff28ce117f997c1da66bcaa#d1a0e050f532015c8ff28ce117f997c1da66bcaa"
+dependencies = [
+ "base64",
+ "kasa-socket",
+ "serde_json",
+]
+
+[[package]]
+name = "kasa-collab"
+version = "0.2.33"
+source = "git+https://github.com/2rami/kasaterm?rev=d1a0e050f532015c8ff28ce117f997c1da66bcaa#d1a0e050f532015c8ff28ce117f997c1da66bcaa"
+dependencies = [
+ "anyhow",
+ "kasa-pty",
+ "kasa-socket",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "kasa-pty"
-version = "0.2.31"
-source = "git+https://github.com/2rami/kasaterm?rev=c982d45c1cf92187d6795b0c4ab76161ec064593#c982d45c1cf92187d6795b0c4ab76161ec064593"
+version = "0.2.33"
+source = "git+https://github.com/2rami/kasaterm?rev=d1a0e050f532015c8ff28ce117f997c1da66bcaa#d1a0e050f532015c8ff28ce117f997c1da66bcaa"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -772,8 +794,8 @@ dependencies = [
 
 [[package]]
 name = "kasa-screen"
-version = "0.2.31"
-source = "git+https://github.com/2rami/kasaterm?rev=c982d45c1cf92187d6795b0c4ab76161ec064593#c982d45c1cf92187d6795b0c4ab76161ec064593"
+version = "0.2.33"
+source = "git+https://github.com/2rami/kasaterm?rev=d1a0e050f532015c8ff28ce117f997c1da66bcaa#d1a0e050f532015c8ff28ce117f997c1da66bcaa"
 dependencies = [
  "anyhow",
  "serde",
@@ -782,8 +804,8 @@ dependencies = [
 
 [[package]]
 name = "kasa-socket"
-version = "0.2.31"
-source = "git+https://github.com/2rami/kasaterm?rev=c982d45c1cf92187d6795b0c4ab76161ec064593#c982d45c1cf92187d6795b0c4ab76161ec064593"
+version = "0.2.33"
+source = "git+https://github.com/2rami/kasaterm?rev=d1a0e050f532015c8ff28ce117f997c1da66bcaa#d1a0e050f532015c8ff28ce117f997c1da66bcaa"
 dependencies = [
  "anyhow",
  "base64",
@@ -805,12 +827,15 @@ dependencies = [
  "bincode",
  "crossbeam-channel",
  "image",
+ "kasa-agents",
+ "kasa-collab",
  "kasa-pty",
  "kasa-screen",
  "kasa-socket",
  "libc",
  "ratatui",
  "serde",
+ "serde_json",
  "unicode-width",
  "windows-sys 0.59.0",
 ]

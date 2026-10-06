@@ -1,6 +1,7 @@
 //! `kasa` — 아무 터미널 안에서 도는 다중 칸 터미널(`kasa tui`)과 그 세션 서버.
 
 mod client;
+mod collab;
 mod config;
 mod graphics;
 mod keys;
@@ -20,12 +21,20 @@ kasa — 아무 터미널 안에서 도는 다중 칸 터미널
   kasa attach [이름]     떨어진 세션에 다시 붙는다
   kasa ls                떠 있는 세션
   kasa kill <이름>       세션을 끝낸다
+  kasa board · tell · done · summon …   협업 명령(kasaterm-cli 와 같다)
   kasa --version
 
 세션 안에서는 접두키(기본 Ctrl-b) 다음 ? 로 단축키를 본다.
 ";
 
 fn main() {
+    // 칸 shim 의 `kasaterm-cli` 는 이 바이너리로 가는 링크다 — 그 이름으로 불리면 협업 CLI 로 돈다.
+    let argv0 = std::env::args_os().next().unwrap_or_default();
+    let called = std::path::Path::new(&argv0).file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+    if called == "kasaterm-cli" {
+        kasa_socket::cli::main();
+        return;
+    }
     let code = match run() {
         Ok(code) => code,
         Err(e) => {
@@ -77,7 +86,12 @@ fn run() -> Result<i32> {
             print!("{USAGE}");
             Ok(0)
         }
-        Some(other) => bail!("모르는 명령 `{other}`\n\n{USAGE}"),
+        // 그 밖의 명령은 협업 CLI(`kasaterm-cli` 와 같은 것)로 넘긴다 — `kasa board`, `kasa tell …`.
+        // CLI 가 스스로를 다시 부를 때(`report-cwd`)도 이 길로 온다.
+        Some(_) => {
+            kasa_socket::cli::main();
+            Ok(0)
+        }
     }
 }
 
