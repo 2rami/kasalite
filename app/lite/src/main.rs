@@ -84,6 +84,10 @@ fn scrub_env() {
     }
 }
 
+pub fn no_focus() -> bool {
+    std::env::var_os("KASALITE_NO_FOCUS").is_some() || std::env::var_os("KASATERM_NO_FOCUS").is_some()
+}
+
 fn main() {
     let argv0 = std::env::args_os().next().unwrap_or_default();
     let called = std::path::Path::new(&argv0).file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
@@ -93,7 +97,15 @@ fn main() {
     }
     scrub_env();
     let _ = std::fs::create_dir_all(config::root());
-    let el = match EventLoop::<app::UserEvent>::with_user_event().build() {
+    let mut builder = EventLoop::<app::UserEvent>::with_user_event();
+    // 검증·측정으로 띄울 때는 사람이 쓰던 앱의 포커스를 뺏지 않는다. winit 은 macOS 에서 기본으로 다른 앱을
+    // 무시하고 활성화하고 Dock 아이콘을 띄운다 — 측정 판마다 창이 앞으로 튀어나왔다.
+    #[cfg(target_os = "macos")]
+    if no_focus() {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        builder.with_activation_policy(ActivationPolicy::Accessory).with_activate_ignoring_other_apps(false);
+    }
+    let el = match builder.build() {
         Ok(el) => el,
         Err(e) => {
             eprintln!("[lite] 이벤트 루프를 못 세웠다: {e}");

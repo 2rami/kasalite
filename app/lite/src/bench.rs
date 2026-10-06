@@ -43,6 +43,8 @@ impl Trace {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
             let _ = writeln!(self.out, r#"{{"ev":"first_present","wall":{wall:.6}}}"#);
+            // 켜기 측정은 앱이 떠 있는 동안 읽으므로 첫 장은 바로 내려 둔다.
+            let _ = self.out.flush();
         }
         let _ = writeln!(self.out, r#"{{"ev":"present","t":{t:.6},"seq":{seq},"cpu":{cpu:.3}}}"#);
         #[cfg(target_os = "macos")]

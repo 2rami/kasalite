@@ -1072,7 +1072,7 @@ impl ApplicationHandler<UserEvent> for App {
         let attrs = Window::default_attributes()
             .with_title("KasaLite")
             .with_inner_size(LogicalSize::new(w, h))
-            .with_active(std::env::var_os("KASALITE_NO_FOCUS").is_none() && std::env::var_os("KASATERM_NO_FOCUS").is_none());
+            .with_active(!crate::no_focus());
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
