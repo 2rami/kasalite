@@ -1,0 +1,33 @@
+[package]
+name = "kasa-tui"
+description = "A multi-pane terminal that runs inside any terminal (Ghostty, iTerm2, Windows Terminal, over SSH), with kasaterm's agent collaboration."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/2rami/kasalite"
+readme = "../../README.md"
+keywords = ["terminal", "multiplexer", "tui", "tmux"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "kasa"
+path = "src/main.rs"
+
+[dependencies]
+kasa-pty.workspace = true
+kasa-screen.workspace = true
+kasa-socket.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+bincode = "1"
+ratatui = "0.30"
+unicode-width = "0.2"
+base64 = "0.22"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }

@@ -1,34 +1,85 @@
-# KasaLite
+# kasalite
 
-터미널만 남긴 [kasaterm](https://github.com/2rami/kasaterm) 고정판. 캐릭터·보드·펫·서버·자동 업데이트·세션 복원이
-없고, pane 나누기·탭·한글 IME·`kasaterm-cli`·헤더 진행 바만 있다. 설정은 색 하나(⌘,).
+[kasaterm](https://github.com/2rami/kasaterm) 의 터미널 엔진 위에 세운 가벼운 터미널 둘을 담는다.
 
-kasaterm 을 kasaterm 안에서 고치다 보면 앱을 굽고 껐다 켤 때마다 그 안의 세션이 죽는다.
-이 앱은 한 번 굽고 **다시 굽지 않는** 용도다 — Ghostty 처럼.
+- **`kasa tui`** — 앱을 깔지 않고 아무 터미널(Ghostty·iTerm2·Windows Terminal·SSH 너머 서버) 안에서
+  tmux 처럼 도는 다중 칸 터미널. 칸 나누기·탭·마우스·스크롤백·한글·kitty 그림을 지원한다.
+- **새 카사라이트** — 120Hz 로 가볍게 도는 바닐라 GUI 터미널(만드는 중).
 
-## 받기
+엔진(PTY·VT·스크롤백·kitty 그림·화면 낱말)의 원본은 kasaterm 레포 `crates/` 다. 여기서는 커밋 하나를
+고정해 git 의존으로 받는다(`Cargo.toml` 의 `[workspace.dependencies]`). 설계는 kasaterm
+[`docs/terminal-engine.md`](https://github.com/2rami/kasaterm/blob/main/docs/terminal-engine.md).
 
-[릴리스](https://github.com/2rami/kasalite/releases)에서 macOS `.dmg` · Windows `.msi`.
-자동 업데이트가 없으니 새 판은 같은 자리에서 받아 덮어쓴다.
+## kasa tui
+
+```sh
+kasa tui              # 세션 main 에 붙는다. 없으면 연다
+kasa tui -s work      # 다른 이름의 세션
+kasa attach [이름]     # 떨어진 세션에 다시 붙는다
+kasa ls               # 떠 있는 세션
+kasa kill <이름>       # 세션을 끝낸다
+```
+
+창을 닫거나 SSH 가 끊겨도 세션 서버와 칸은 산다. 다시 `kasa attach` 로 붙는다.
+
+### 단축키
+
+접두키(기본 `Ctrl-b`) 다음에 누른다. 세션 안에서 `접두키 ?` 로 같은 표를 본다.
+
+| 키 | 하는 일 |
+|---|---|
+| `%` `\|` | 옆으로 나누기 |
+| `"` `-` | 아래로 나누기 |
+| 화살표 · `h` `j` `k` `l` | 칸 옮기기 |
+| `o` | 다음 칸 |
+| `z` | 칸 확대 / 되돌리기 |
+| `x` | 칸 닫기 |
+| `c` | 새 탭 |
+| `n` `p` `0`–`9` | 탭 옮기기 |
+| `,` | 탭 이름 바꾸기 |
+| `[` | 스크롤 (`q` 로 끝) |
+| `d` | 떨어지기 |
+| 접두키 두 번 | 접두키를 칸에 보내기 |
+
+마우스: 칸을 눌러 초점, 경계선을 끌어 크기, 탭 줄을 눌러 탭, 휠로 스크롤백. 끌어서 고른 글은 OSC 52 로
+바깥 터미널 클립보드에 들어간다. 칸 안 프로그램이 마우스를 켰으면 그 프로그램에 넘기고, `Shift` 를
+누르고 끌면 그래도 고른다.
+
+### 설정
+
+`~/.config/kasa/tui.conf`:
+
+```text
+prefix = C-a
+```
+
+환경 변수 `KASA_TUI_PREFIX=C-a` 가 앞선다. tmux 안에서 돌릴 때는 접두키를 tmux 와 다르게 둔다.
 
 ## 빌드
 
 ```sh
-scripts/build-lite-app.sh --install   # dist/KasaLite.app → ~/Applications/KasaLite.app
-pwsh scripts\windows\package.ps1      # dist\kasalite-v<판>-windows-x86_64.msi (Windows)
+cargo build --release -p kasa-tui     # target/release/kasa
 ```
 
-태그(`vX.Y.Z`)를 밀면 `.github/workflows/release.yml` 이 둘 다 구워 릴리스에 붙인다.
-태그 전에 Windows 빌드만 보려면 Actions 에서 이 워크플로를 수동 실행한다 — 맥에서는
-윈도우 타깃 크로스 컴파일이 `ring` 의 C 코드에서 막혀 미리 볼 수 없다.
+엔진을 고치면서 함께 볼 때는 kasaterm 작업 트리로 의존을 돌린다(레포에 넣지 않는 파일):
 
-살림은 `~/.config/kasaterm-lite/` (설정·창 크기·소켓 `lite.sock`). 본판 kasaterm 과 같이 떠도 서로 안 보인다.
+```toml
+# patch.toml
+[patch."https://github.com/2rami/kasaterm"]
+kasa-pty = { path = "../kasaterm/crates/kasa-pty" }
+kasa-screen = { path = "../kasaterm/crates/kasa-screen" }
+kasa-socket = { path = "../kasaterm/crates/kasa-socket" }
+```
 
-바깥에서 CLI 를 부르려면 `KASATERM_SOCKET_PATH=~/.config/kasaterm-lite/lite.sock kasaterm-cli …`. pane 안에서는 자동.
+```sh
+cargo --config patch.toml build -p kasa-tui
+```
 
-## 본판과의 관계
+## 옛 카사라이트(v0.1)
 
-같은 코드에 런타임 모드 하나를 얹은 것이다(`ViewerLaunch::lite`). 본판 kasaterm 의 수정을 따라가려면
-`app/kasaterm`·`crates/` 를 옮겨 오면 되고, 라이트 전용 분기는 `self.lite` / `crate::lite_mode()` 로 찾는다.
+본판을 통째로 복사해 터미널만 남긴 옛 판은 [`legacy-v0.1`](https://github.com/2rami/kasalite/tree/legacy-v0.1)
+가지와 `v0.1.0` 태그에 그대로 있다. 릴리스의 `.dmg`·`.msi` 도 그 판이다.
+
+## 라이선스
 
 MIT
