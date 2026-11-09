@@ -4,6 +4,7 @@
 //! 같은 바이너리를 `kasaterm-cli` 라는 이름으로 부르면 칸 안 제어 CLI 로 돈다(칸 shim 이 그 링크를 둔다).
 
 mod app;
+mod args;
 mod bench;
 mod config;
 mod control;
@@ -96,6 +97,21 @@ fn main() {
         kasa_socket::cli::main();
         return;
     }
+    let launch = match args::parse(std::env::args_os().skip(1)) {
+        Ok(args::Parsed::Run(l)) => l,
+        Ok(args::Parsed::Help) => {
+            print!("{}", args::USAGE);
+            return;
+        }
+        Ok(args::Parsed::Version) => {
+            println!("kasaterm-lite {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Err(e) => {
+            eprint!("kasaterm-lite: {e}\n\n{}", args::USAGE);
+            std::process::exit(2);
+        }
+    };
     scrub_env();
     let _ = std::fs::create_dir_all(config::root());
     let mut builder = EventLoop::<app::UserEvent>::with_user_event();
@@ -113,7 +129,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut app = app::App::new(el.create_proxy());
+    let mut app = app::App::new(el.create_proxy(), launch);
     if let Err(e) = el.run_app(&mut app) {
         eprintln!("[lite] {e}");
         std::process::exit(1);

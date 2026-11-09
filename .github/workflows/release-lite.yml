@@ -153,6 +153,9 @@ jobs:
           Debian·Ubuntu 는 `sudo apt install ./KasaLite-*-linux-x86_64.deb`, 그 밖은 `.tar.gz` 를 풀어 `bin/kasaterm-lite` 를 실행.
           GPU 가 없는 기계(가상 머신 등)에선 CPU 로 그리고 바뀐 줄만 화면에 보냅니다. `KASATERM_RENDERER=gpu|cpu` 로 바꿀 수 있어요.
 
+          ## 명령줄
+          `kasaterm-lite -T 제목 -e 명령 [인자…]` — 첫 칸에서 셸 대신 명령을 띄웁니다(alacritty 와 같은 꼴). `--help` 로 전체.
+
           ## 단축키 (macOS ⌘ / Windows Ctrl+Shift)
           - D 오른쪽으로 나누기 · ⇧D(Windows: E) 아래로 나누기 · T 새 탭 · W 칸 닫기
           - [ ] 칸 이동 · ⇧[ ⇧] 탭 이동 · 1~9 탭 고르기 · = - 0 글자 크기 · C V 복사·붙여넣기

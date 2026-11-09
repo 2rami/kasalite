@@ -32,6 +32,14 @@ Mesa llvmpipe 가 CPU 로 창 전체를 매 장 칠하는 것이라, 같은 인�
 살림은 `~/.config/kasaterm-lite/`(옛 v0.1 과 같은 자리, `settings.json` 의 `font_size`·`font_path`).
 자동 업데이트는 없다.
 
+```sh
+kasaterm-lite -T "에이전트 셸" -e os-desktop-watch   # 첫 칸에 셸 대신 명령, 창 제목
+kasaterm-lite -e sh -c 'tail -f log.txt'           # -e 뒤는 전부 명령의 인자
+```
+
+`-e`(`--command`)·`-T`(`--title`)는 alacritty 와 같은 꼴이라 다른 터미널을 부르던 바로가기를 이름만 바꿔 옮긴다.
+`-e` 명령은 셸을 거치지 않고 argv 그대로 뜨고, 끝나면 그 칸이 닫힌다(마지막 칸이면 창도). 나누기·새 탭은 셸이다.
+
 박자: macOS 는 디스플레이 링크(ProMotion 120Hz 요청) + Immediate + drawable 3장, 키 메아리는 박자를 안
 기다리고 바로 그린다. 고른 근거는 [`spikes/frame-pacing`](spikes/frame-pacing/README.md), 목표 수치 재는 법은
 [`bench/`](bench/README.md).

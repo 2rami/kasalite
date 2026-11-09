@@ -91,10 +91,13 @@ pub struct App {
     link: Option<crate::mac::Link>,
     trace: Option<Trace>,
     bench: Option<Bench>,
+    /// `-e` 로 받은 명령 — 첫 칸 하나만 이걸로 뜨고, 그 뒤 나누기·새 탭은 셸이다.
+    first_command: Vec<std::ffi::OsString>,
+    title: String,
 }
 
 impl App {
-    pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub fn new(proxy: EventLoopProxy<UserEvent>, launch: crate::args::Launch) -> Self {
         let settings = crate::config::load();
         Self {
             proxy,
@@ -126,6 +129,8 @@ impl App {
             link: None,
             trace: None,
             bench: None,
+            first_command: launch.command,
+            title: launch.title.unwrap_or_else(|| "KasaLite".into()),
         }
     }
 
@@ -135,6 +140,7 @@ impl App {
         let id = format!("%{}", self.next_pane);
         self.next_pane += 1;
         let session = Arc::new(PtySession::start(PtyOptions {
+            command: std::mem::take(&mut self.first_command),
             cwd,
             cols: size.0.max(2),
             rows: size.1.max(1),
@@ -1081,7 +1087,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let (w, h) = self.settings.window.unwrap_or((1100.0, 700.0));
         let attrs = Window::default_attributes()
-            .with_title("KasaLite")
+            .with_title(self.title.as_str())
             .with_inner_size(LogicalSize::new(w, h))
             .with_active(!crate::no_focus());
         let window = match el.create_window(attrs) {

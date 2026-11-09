@@ -13,14 +13,14 @@ repository = "https://github.com/2rami/kasalite"
 # 터미널 엔진의 원본은 kasaterm 레포 `crates/` 다. 여기서는 커밋 하나를 고정해 받는다 —
 # 엔진을 올릴 때만 이 rev 를 바꾼다(docs/terminal-engine.md, kasaterm).
 [workspace.dependencies]
-kasa-pty = { git = "https://github.com/2rami/kasaterm", rev = "69edec6a24bfe52e2a2bc42a99656aeb9df61965", default-features = false }
-kasa-screen = { git = "https://github.com/2rami/kasaterm", rev = "69edec6a24bfe52e2a2bc42a99656aeb9df61965" }
-kasa-socket = { git = "https://github.com/2rami/kasaterm", rev = "69edec6a24bfe52e2a2bc42a99656aeb9df61965", default-features = false }
-kasa-collab = { git = "https://github.com/2rami/kasaterm", rev = "69edec6a24bfe52e2a2bc42a99656aeb9df61965" }
-kasa-agents = { git = "https://github.com/2rami/kasaterm", rev = "69edec6a24bfe52e2a2bc42a99656aeb9df61965" }
-kasa-gridview = { git = "https://github.com/2rami/kasaterm", rev = "69edec6a24bfe52e2a2bc42a99656aeb9df61965" }
-kasa-cells = { git = "https://github.com/2rami/kasaterm", rev = "69edec6a24bfe52e2a2bc42a99656aeb9df61965" }
-kasa-ime = { git = "https://github.com/2rami/kasaterm", rev = "69edec6a24bfe52e2a2bc42a99656aeb9df61965" }
+kasa-pty = { git = "https://github.com/2rami/kasaterm", rev = "70955c92f1cf4519a58373f567c45c064bda1bd6", default-features = false }
+kasa-screen = { git = "https://github.com/2rami/kasaterm", rev = "70955c92f1cf4519a58373f567c45c064bda1bd6" }
+kasa-socket = { git = "https://github.com/2rami/kasaterm", rev = "70955c92f1cf4519a58373f567c45c064bda1bd6", default-features = false }
+kasa-collab = { git = "https://github.com/2rami/kasaterm", rev = "70955c92f1cf4519a58373f567c45c064bda1bd6" }
+kasa-agents = { git = "https://github.com/2rami/kasaterm", rev = "70955c92f1cf4519a58373f567c45c064bda1bd6" }
+kasa-gridview = { git = "https://github.com/2rami/kasaterm", rev = "70955c92f1cf4519a58373f567c45c064bda1bd6" }
+kasa-cells = { git = "https://github.com/2rami/kasaterm", rev = "70955c92f1cf4519a58373f567c45c064bda1bd6" }
+kasa-ime = { git = "https://github.com/2rami/kasaterm", rev = "70955c92f1cf4519a58373f567c45c064bda1bd6" }
 anyhow = "1"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
