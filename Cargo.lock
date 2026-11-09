@@ -1313,7 +1313,7 @@ dependencies = [
 [[package]]
 name = "kasa-agents"
 version = "0.2.35"
-source = "git+https://github.com/2rami/kasaterm?rev=70955c92f1cf4519a58373f567c45c064bda1bd6#70955c92f1cf4519a58373f567c45c064bda1bd6"
+source = "git+https://github.com/2rami/kasaterm?rev=5b10155f6b471ab4dcada7803f03394b8275c992#5b10155f6b471ab4dcada7803f03394b8275c992"
 dependencies = [
  "base64",
  "kasa-socket",
@@ -1323,7 +1323,7 @@ dependencies = [
 [[package]]
 name = "kasa-cells"
 version = "0.2.35"
-source = "git+https://github.com/2rami/kasaterm?rev=70955c92f1cf4519a58373f567c45c064bda1bd6#70955c92f1cf4519a58373f567c45c064bda1bd6"
+source = "git+https://github.com/2rami/kasaterm?rev=5b10155f6b471ab4dcada7803f03394b8275c992#5b10155f6b471ab4dcada7803f03394b8275c992"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1335,7 +1335,7 @@ dependencies = [
 [[package]]
 name = "kasa-collab"
 version = "0.2.35"
-source = "git+https://github.com/2rami/kasaterm?rev=70955c92f1cf4519a58373f567c45c064bda1bd6#70955c92f1cf4519a58373f567c45c064bda1bd6"
+source = "git+https://github.com/2rami/kasaterm?rev=5b10155f6b471ab4dcada7803f03394b8275c992#5b10155f6b471ab4dcada7803f03394b8275c992"
 dependencies = [
  "anyhow",
  "kasa-pty",
@@ -1347,7 +1347,7 @@ dependencies = [
 [[package]]
 name = "kasa-gridview"
 version = "0.2.35"
-source = "git+https://github.com/2rami/kasaterm?rev=70955c92f1cf4519a58373f567c45c064bda1bd6#70955c92f1cf4519a58373f567c45c064bda1bd6"
+source = "git+https://github.com/2rami/kasaterm?rev=5b10155f6b471ab4dcada7803f03394b8275c992#5b10155f6b471ab4dcada7803f03394b8275c992"
 dependencies = [
  "anyhow",
  "image",
@@ -1366,12 +1366,12 @@ dependencies = [
 [[package]]
 name = "kasa-ime"
 version = "0.2.35"
-source = "git+https://github.com/2rami/kasaterm?rev=70955c92f1cf4519a58373f567c45c064bda1bd6#70955c92f1cf4519a58373f567c45c064bda1bd6"
+source = "git+https://github.com/2rami/kasaterm?rev=5b10155f6b471ab4dcada7803f03394b8275c992#5b10155f6b471ab4dcada7803f03394b8275c992"
 
 [[package]]
 name = "kasa-pty"
 version = "0.2.35"
-source = "git+https://github.com/2rami/kasaterm?rev=70955c92f1cf4519a58373f567c45c064bda1bd6#70955c92f1cf4519a58373f567c45c064bda1bd6"
+source = "git+https://github.com/2rami/kasaterm?rev=5b10155f6b471ab4dcada7803f03394b8275c992#5b10155f6b471ab4dcada7803f03394b8275c992"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1390,7 +1390,7 @@ dependencies = [
 [[package]]
 name = "kasa-screen"
 version = "0.2.35"
-source = "git+https://github.com/2rami/kasaterm?rev=70955c92f1cf4519a58373f567c45c064bda1bd6#70955c92f1cf4519a58373f567c45c064bda1bd6"
+source = "git+https://github.com/2rami/kasaterm?rev=5b10155f6b471ab4dcada7803f03394b8275c992#5b10155f6b471ab4dcada7803f03394b8275c992"
 dependencies = [
  "anyhow",
  "serde",
@@ -1400,7 +1400,7 @@ dependencies = [
 [[package]]
 name = "kasa-socket"
 version = "0.2.35"
-source = "git+https://github.com/2rami/kasaterm?rev=70955c92f1cf4519a58373f567c45c064bda1bd6#70955c92f1cf4519a58373f567c45c064bda1bd6"
+source = "git+https://github.com/2rami/kasaterm?rev=5b10155f6b471ab4dcada7803f03394b8275c992#5b10155f6b471ab4dcada7803f03394b8275c992"
 dependencies = [
  "anyhow",
  "base64",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "kasalite"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "arboard",

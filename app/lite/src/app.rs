@@ -39,6 +39,9 @@ const FALLBACK_FRAME: Duration = Duration::from_micros(8_333);
 /// CPU 로 그릴 때의 박자 하한. 장마다 CPU 가 칠하고 VNC 너머로 보는 사람에게 60Hz 이상은 안 닿는다 —
 /// 2코어 VM 에선 그 몫이 그대로 에이전트에게 돌아간다.
 const SOFT_FRAME: Duration = Duration::from_micros(16_667);
+/// 리눅스 창 이름(Wayland app_id·X11 WM_CLASS). `scripts/lite/package-linux.sh` 의 .desktop 파일 이름·StartupWMClass 와 같아야 한다.
+#[cfg(target_os = "linux")]
+const APP_ID: &str = "kasaterm-lite";
 /// 내장 Nerd 기호 — 시스템 글꼴에 없는 아이콘(U+E000..F8FF·U+F0000..)의 마지막 그물.
 const SYMBOLS_NERD_FONT_MONO: &[u8] = include_bytes!("../../../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 const TAB_BG: [u8; 4] = [30, 36, 44, 255];
@@ -1090,6 +1093,13 @@ impl ApplicationHandler<UserEvent> for App {
             .with_title(self.title.as_str())
             .with_inner_size(LogicalSize::new(w, h))
             .with_active(!crate::no_focus());
+        // Wayland 은 이름을 줘야 app_id 를 보낸다 — 비면 작업 표시줄·창 규칙·.desktop 이 이 창을 못 알아본다.
+        // X11 에선 같은 값이 WM_CLASS 가 된다(안 주면 실행 파일 이름이라, 링크 이름으로 띄우면 갈렸다).
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attrs.with_name(APP_ID, APP_ID)
+        };
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

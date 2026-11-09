@@ -43,7 +43,8 @@ mkdir -p "$ROOTFS/bin" "$ROOTFS/share/applications" "$ROOTFS/share/icons/hicolor
 cp "$BIN" "$ROOTFS/bin/kasaterm-lite"
 ln -s kasaterm-lite "$ROOTFS/bin/kasaterm-cli"
 cp "$ICON" "$ROOTFS/share/icons/hicolor/256x256/apps/kasalite.png"
-cat > "$ROOTFS/share/applications/kasalite.desktop" <<'DESKTOP'
+# 파일 이름이 desktop id 다 — Wayland 셸은 창의 app_id(`kasaterm-lite`, app.rs APP_ID)와 이 이름을 맞춰 아이콘을 찾는다.
+cat > "$ROOTFS/share/applications/kasaterm-lite.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
 Name=KasaLite
