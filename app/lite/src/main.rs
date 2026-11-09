@@ -57,6 +57,7 @@ const KEEP_KASATERM: &[&str] = &[
     "KASATERM_P3_ROOT",
     "KASATERM_PIXEL_FORMAT",
     "KASATERM_CELL_TIGHTEN",
+    "KASATERM_RENDERER",
 ];
 
 fn scrub_env() {

@@ -36,6 +36,9 @@ const PAD_Y: f32 = 4.0;
 const HOLD: Duration = Duration::from_millis(1000);
 /// 링크가 없는 플랫폼의 박자 하한.
 const FALLBACK_FRAME: Duration = Duration::from_micros(8_333);
+/// CPU 로 그릴 때의 박자 하한. 장마다 CPU 가 칠하고 VNC 너머로 보는 사람에게 60Hz 이상은 안 닿는다 —
+/// 2코어 VM 에선 그 몫이 그대로 에이전트에게 돌아간다.
+const SOFT_FRAME: Duration = Duration::from_micros(16_667);
 /// 내장 Nerd 기호 — 시스템 글꼴에 없는 아이콘(U+E000..F8FF·U+F0000..)의 마지막 그물.
 const SYMBOLS_NERD_FONT_MONO: &[u8] = include_bytes!("../../../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 const TAB_BG: [u8; 4] = [30, 36, 44, 255];
@@ -587,6 +590,14 @@ impl App {
 
     // ---- 박자 -------------------------------------------------------------------------------------
 
+    fn frame_floor(&self) -> Duration {
+        if self.grid.as_ref().is_some_and(|g| g.is_soft()) {
+            SOFT_FRAME
+        } else {
+            FALLBACK_FRAME
+        }
+    }
+
     fn holding(&self) -> bool {
         self.hold_until.is_some_and(|h| Instant::now() < h)
     }
@@ -606,7 +617,7 @@ impl App {
             }
             return;
         }
-        if self.last_render.elapsed() >= FALLBACK_FRAME {
+        if self.last_render.elapsed() >= self.frame_floor() {
             self.render();
         }
     }
@@ -1194,7 +1205,7 @@ impl ApplicationHandler<UserEvent> for App {
         #[cfg(not(target_os = "macos"))]
         let linked = false;
         if self.dirty && !linked {
-            let due = self.last_render + FALLBACK_FRAME;
+            let due = self.last_render + self.frame_floor();
             if Instant::now() >= due {
                 self.render();
             } else {
