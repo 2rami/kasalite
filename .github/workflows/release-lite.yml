@@ -83,7 +83,7 @@ jobs:
         run: |
           bash scripts/lite/package-linux.sh
           cd dist
-          for f in kasalite-*-linux-x86_64.tar.gz kasalite-*-linux-x86_64.deb; do
+          for f in KasaLite-*-linux-x86_64.tar.gz KasaLite-*-linux-x86_64.deb; do
             sha256sum "$f" > "$f.sha256"
           done
       - name: Attach Linux packages to release
@@ -91,10 +91,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/kasalite-*-linux-x86_64.tar.gz
-            dist/kasalite-*-linux-x86_64.tar.gz.sha256
-            dist/kasalite-*-linux-x86_64.deb
-            dist/kasalite-*-linux-x86_64.deb.sha256
+            dist/KasaLite-*-linux-x86_64.tar.gz
+            dist/KasaLite-*-linux-x86_64.tar.gz.sha256
+            dist/KasaLite-*-linux-x86_64.deb
+            dist/KasaLite-*-linux-x86_64.deb.sha256
           fail_on_unmatched_files: true
           make_latest: false
       - name: Upload Linux artifact
@@ -102,7 +102,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kasalite-linux-x86_64
-          path: dist/kasalite-*-linux-x86_64.*
+          path: dist/KasaLite-*-linux-x86_64.*
 
   build-dmg:
     runs-on: macos-latest
@@ -150,7 +150,7 @@ jobs:
           `.msi` 다운로드 → 실행. SmartScreen 경고가 뜨면 "추가 정보 → 실행".
 
           ## 설치 (Linux x86_64, X11)
-          Debian·Ubuntu 는 `sudo apt install ./kasalite-*-linux-x86_64.deb`, 그 밖은 `.tar.gz` 를 풀어 `bin/kasaterm-lite` 를 실행.
+          Debian·Ubuntu 는 `sudo apt install ./KasaLite-*-linux-x86_64.deb`, 그 밖은 `.tar.gz` 를 풀어 `bin/kasaterm-lite` 를 실행.
           GPU 가 없는 기계(가상 머신 등)에선 CPU 로 그리고 바뀐 줄만 화면에 보냅니다. `KASATERM_RENDERER=gpu|cpu` 로 바꿀 수 있어요.
 
           ## 단축키 (macOS ⌘ / Windows Ctrl+Shift)

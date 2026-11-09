@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 리눅스 x86_64 판을 굽는다: dist/kasalite-v<판>-linux-x86_64.tar.gz (+ dpkg-deb 가 있으면 .deb).
+# 리눅스 x86_64 판을 굽는다: dist/KasaLite-<판>-linux-x86_64.tar.gz (+ dpkg-deb 가 있으면 .deb).
 # 실행 파일 하나 — 칸 안 `kasaterm-cli` 는 같은 바이너리로 가는 링크라 따로 싣지 않는다.
 # GPU 렌더 노드가 없는 기계(에이전트 VM)에선 엔진이 알아서 CPU 로 그린다. 그래서 libEGL·Mesa 를 요구하지 않는다.
 #
@@ -35,7 +35,7 @@ if [[ -z "$BIN" ]]; then
 fi
 [[ -x "$BIN" ]] || { echo "error: $BIN 이 없다" >&2; exit 1; }
 
-NAME="kasalite-v$VERSION-linux-x86_64"
+NAME="KasaLite-$VERSION-linux-x86_64"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "${STAGE:?}"' EXIT
 ROOTFS="$STAGE/$NAME"

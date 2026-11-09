@@ -39,7 +39,7 @@ Mesa llvmpipe 가 CPU 로 창 전체를 매 장 칠하는 것이라, 같은 인�
 ```sh
 scripts/lite/bundle-mac.sh --dmg      # dist/KasaLite.app · KasaLite-<판>-macos-<arch>.dmg
 pwsh scripts/lite/package-windows.ps1  # dist/KasaLite-<판>-windows-x86_64.msi (Windows)
-scripts/lite/package-linux.sh          # dist/kasalite-v<판>-linux-x86_64.tar.gz (+ dpkg-deb 가 있으면 .deb)
+scripts/lite/package-linux.sh          # dist/KasaLite-<판>-linux-x86_64.tar.gz (+ dpkg-deb 가 있으면 .deb)
 ```
 
 맥에서 리눅스 판을 미리 굽을 때는 `cargo zigbuild --release -p kasalite --target x86_64-unknown-linux-gnu.2.36` 뒤
