@@ -64,13 +64,25 @@ jobs:
 
   build-linux:
     # 22.04(glibc 2.35)에서 구워 Debian 12·13, Ubuntu 22.04+ 가 다 받게 한다.
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+            deb_arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
           lfs: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-${{ matrix.arch }}
       - name: Verify tag matches lite version
         if: startsWith(github.ref, 'refs/tags/lite-v')
         run: |
@@ -79,30 +91,35 @@ jobs:
             echo "::error::app/lite/Cargo.toml version($VER) != tag($GITHUB_REF_NAME)"
             exit 1
           fi
+      - name: Test native Linux target
+        run: cargo test --locked -p kasalite
       - name: Build .tar.gz + .deb
         run: |
           bash scripts/lite/package-linux.sh
           cd dist
-          for f in KasaLite-*-linux-x86_64.tar.gz KasaLite-*-linux-x86_64.deb; do
+          for f in KasaLite-*-linux-${{ matrix.arch }}.tar.gz KasaLite-*-linux-${{ matrix.arch }}.deb; do
             sha256sum "$f" > "$f.sha256"
           done
+          test "$(dpkg-deb -f KasaLite-*-linux-${{ matrix.arch }}.deb Architecture)" = '${{ matrix.deb_arch }}'
+          REQUIRED="$(readelf --version-info ../target/release/kasaterm-lite | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | cut -d_ -f2 | sort -Vu | tail -1)"
+          dpkg --compare-versions "$REQUIRED" le 2.35
       - name: Attach Linux packages to release
         if: startsWith(github.ref, 'refs/tags/lite-v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/KasaLite-*-linux-x86_64.tar.gz
-            dist/KasaLite-*-linux-x86_64.tar.gz.sha256
-            dist/KasaLite-*-linux-x86_64.deb
-            dist/KasaLite-*-linux-x86_64.deb.sha256
+            dist/KasaLite-*-linux-${{ matrix.arch }}.tar.gz
+            dist/KasaLite-*-linux-${{ matrix.arch }}.tar.gz.sha256
+            dist/KasaLite-*-linux-${{ matrix.arch }}.deb
+            dist/KasaLite-*-linux-${{ matrix.arch }}.deb.sha256
           fail_on_unmatched_files: true
           make_latest: false
       - name: Upload Linux artifact
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: kasalite-linux-x86_64
-          path: dist/KasaLite-*-linux-x86_64.*
+          name: kasalite-linux-${{ matrix.arch }}
+          path: dist/KasaLite-*-linux-${{ matrix.arch }}.*
 
   build-dmg:
     runs-on: macos-latest
@@ -149,8 +166,8 @@ jobs:
           ## 설치 (Windows)
           `.msi` 다운로드 → 실행. SmartScreen 경고가 뜨면 "추가 정보 → 실행".
 
-          ## 설치 (Linux x86_64, X11)
-          Debian·Ubuntu 는 `sudo apt install ./KasaLite-*-linux-x86_64.deb`, 그 밖은 `.tar.gz` 를 풀어 `bin/kasaterm-lite` 를 실행.
+          ## 설치 (Linux x86_64·aarch64, Wayland·X11)
+          Debian·Ubuntu 는 아키텍처에 맞는 `.deb` 를 `sudo apt install ./KasaLite-<판>-linux-<arch>.deb` 로 설치하고, 그 밖은 `.tar.gz` 를 풀어 `bin/kasaterm-lite` 를 실행.
           GPU 가 없는 기계(가상 머신 등)에선 CPU 로 그리고 바뀐 줄만 화면에 보냅니다. `KASATERM_RENDERER=gpu|cpu` 로 바꿀 수 있어요.
 
           ## 명령줄

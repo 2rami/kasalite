@@ -12,12 +12,12 @@
 
 ## 카사라이트
 
-macOS `.dmg`·Windows `.msi`·Linux x86_64 `.deb`/`.tar.gz` 를 [릴리스](https://github.com/2rami/kasalite/releases)의
+macOS `.dmg`·Windows `.msi`·Linux x86_64/aarch64 `.deb`/`.tar.gz` 를 [릴리스](https://github.com/2rami/kasalite/releases)의
 `lite-v*` 판에서 받는다. 칸 그리기는 본판 카사텀과 같은 엔진(`kasa-gridview`)이라 글자·색·상자 선·그림이 본판과 같게 나온다.
 
-리눅스(X11)는 GPU 렌더 노드(`/dev/dri/renderD*`)가 없으면 **CPU 로 칠한다** — GPU 없는 가상 머신의 GL 은 어차피
+리눅스(Wayland·X11)는 GPU 렌더 노드(`/dev/dri/renderD*`)가 없으면 **CPU 로 칠한다** — GPU 없는 가상 머신의 GL 은 어차피
 Mesa llvmpipe 가 CPU 로 창 전체를 매 장 칠하는 것이라, 같은 인스턴스 목록을 직접 칠하고 바뀐 줄만 X 서버(VNC)에
-넘기는 쪽이 가볍다. 이 경로는 libEGL·Mesa 가 없어도 뜬다. `KASATERM_RENDERER=gpu|cpu` 로 바꾼다.
+넘기는 쪽이 가볍다. Wayland는 공유 메모리 표면으로 낸다. 이 경로는 libEGL·Mesa 가 없어도 뜬다. `KASATERM_RENDERER=gpu|cpu` 로 바꾼다.
 
 | 단축키(macOS ⌘ · Windows Ctrl+Shift) | 하는 일 |
 |---|---|
@@ -47,11 +47,16 @@ kasaterm-lite -e sh -c 'tail -f log.txt'           # -e 뒤는 전부 명령의 
 ```sh
 scripts/lite/bundle-mac.sh --dmg      # dist/KasaLite.app · KasaLite-<판>-macos-<arch>.dmg
 pwsh scripts/lite/package-windows.ps1  # dist/KasaLite-<판>-windows-x86_64.msi (Windows)
-scripts/lite/package-linux.sh          # dist/KasaLite-<판>-linux-x86_64.tar.gz (+ dpkg-deb 가 있으면 .deb)
+bash scripts/lite/package-linux.sh     # dist/KasaLite-<판>-linux-<x86_64|aarch64>.tar.gz (+ .deb)
 ```
 
 맥에서 리눅스 판을 미리 굽을 때는 `cargo zigbuild --release -p kasalite --target x86_64-unknown-linux-gnu.2.36` 뒤
-`scripts/lite/package-linux.sh --bin <그 실행 파일>`. 창·X11·EGL 라이브러리를 전부 실행 때 dlopen 해서 링크할 것이 없다.
+`bash scripts/lite/package-linux.sh --bin <그 실행 파일>`. ELF 검사는 binutils의 `readelf` 또는 `greadelf`를 사용한다.
+창·X11·EGL 라이브러리를 전부 실행 때 dlopen 해서 링크할 것이 없다.
+
+Linux 릴리스는 `ubuntu-22.04`와 `ubuntu-22.04-arm`에서 각각 네이티브로 빌드한다. 패키지 이름과 deb의
+`amd64`/`arm64`는 호스트 이름 대신 실행 파일의 ELF 헤더로 결정한다. glibc 요구 버전도 ELF에서 읽어 deb에
+적으며, CI는 2.35 이하인지 확인한다. ARM에서도 같은 `kasa-gridview` CPU 엔진을 사용한다.
 
 ## kasa tui
 
